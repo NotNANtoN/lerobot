@@ -806,7 +806,8 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
         print(f"[BASE POSE] Recorded initial pose as home: {[f'{x:.1f}°' for x in home_pose]}")
 
         episodes = 0
-        target_episodes = args.num_episodes if args.num_episodes > 0 else float("inf")
+        num_ep = getattr(args, "num_episodes", 1)
+        target_episodes = num_ep if num_ep > 0 else float("inf")
         while episodes < target_episodes:
             episodes += 1
             print(f"\n{'=' * 55}")
@@ -817,11 +818,12 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
 
             if episodes < target_episodes:
                 print(f"\n[RESET] Episode {episodes} complete. Smoothly returning to base position...")
-                _smooth_move_to(robot, home_pose, duration_s=args.home_duration)
+                _smooth_move_to(robot, home_pose, duration_s=getattr(args, "home_duration", 2.0))
                 print(f"[RESET] Base position reached. Reset the scene ({args.reset_time:.0f}s)...")
+                reset_time = getattr(args, "reset_time", 6.0)
                 countdown_start = time.monotonic()
-                while time.monotonic() - countdown_start < args.reset_time:
-                    remaining = args.reset_time - (time.monotonic() - countdown_start)
+                while time.monotonic() - countdown_start < reset_time:
+                    remaining = reset_time - (time.monotonic() - countdown_start)
                     print(f"  ⏳ Reset countdown: {int(remaining) + 1}s...", end="\r", flush=True)
                     time.sleep(0.5)
                 print("\n  ✅ Reset countdown complete! Starting next episode.")
@@ -832,7 +834,7 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
     finally:
         if home_pose is not None and robot.is_connected:
             print("[SHUTDOWN] Returning smoothly to base position...")
-            _smooth_move_to(robot, home_pose, duration_s=args.home_duration)
+            _smooth_move_to(robot, home_pose, duration_s=getattr(args, "home_duration", 2.0))
         print("[SHUTDOWN] Softly releasing motor torques sequentially...")
         _soft_release_torque(robot)
         try:
@@ -1017,9 +1019,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         args.resolved_checkpoint, args.policy = aliases["cosmos3_lora"]
 
-    # Cosmos 2B models require --no-compile to merge LoRA cleanly before execution
-    if "cosmos2b" in args.resolved_checkpoint:
-        args.compile = False
+    # Cosmos 2B LoRA is now merged prior to torch.compile, so compile is supported
 
     if not args.dry_run:
         if not args.robot_port:

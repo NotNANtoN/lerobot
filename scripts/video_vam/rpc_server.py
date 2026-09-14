@@ -153,6 +153,7 @@ class RPCApplication:
 
             self.backend = SmolVLABackend.from_pretrained(str(args.checkpoint), device=self.device)
             self.policy = self.backend.policy
+            self.policy._enable_compile = args.compile
             if self.policy.config.adapt_to_pi_aloha or self.policy.config.use_delta_joint_actions_aloha:
                 raise ValueError("SO follower RPC does not support Aloha action transforms")
             if self.policy.config.action_feature.shape != (6,) and list(

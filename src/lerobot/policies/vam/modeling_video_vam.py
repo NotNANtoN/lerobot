@@ -127,6 +127,9 @@ class VideoVAMPolicy(PreTrainedPolicy):
             num_steps=int(metadata.get("action_semantics", {}).get("euler_steps", 10)),
             input_channels=input_channels,
         ).eval()
+        should_compile = getattr(config, "cosmos_torch_compile", False)
+        if should_compile and str(config.device).startswith("cuda") and hasattr(torch, "compile"):
+            self.decoder._vector_field = torch.compile(self.decoder._vector_field, mode="max-autotune")
         self.extractor, self.prompt_embedding = self._build_extractor()
 
     @classmethod
@@ -196,6 +199,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
             from .cosmos_prompt_embedding import load_prompt_embedding
 
             prompt = load_prompt_embedding(self.config.cosmos_prompt).embedding
+            should_compile = getattr(self.config, "cosmos_torch_compile", False)
+            compile_mode = getattr(self.config, "cosmos_compile_mode", "default")
             extractor = CosmosPredict2Extractor(
                 CosmosPredict2ExtractorConfig(
                     checkpoint_path=self.config.cosmos_checkpoint,
@@ -208,8 +213,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     seed=0,
                     attention_backend=self.config.cosmos_attention_backend,
                     compile_friendly=self.config.cosmos_compile_friendly,
-                    torch_compile=self.config.cosmos_torch_compile,
-                    compile_mode=self.config.cosmos_compile_mode,
+                    torch_compile=False,
+                    compile_mode=compile_mode,
                     use_cuda_graphs=self.config.cosmos_use_cuda_graphs,
                     state_t=self.config.cosmos_state_t,
                     fp8_linear=self.config.cosmos_fp8_linear,
@@ -221,6 +226,17 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 and Path(self.config.cosmos_lora_weights).is_file()
             ):
                 merge_lora_file_into_base(extractor.backbone, self.config.cosmos_lora_weights)
+            if should_compile and extractor.device.type == "cuda":
+                extractor.backbone = torch.compile(
+                    extractor.backbone,
+                    mode=compile_mode,
+                )
+                if hasattr(extractor.tokenizer, "model") and hasattr(extractor.tokenizer.model, "model"):
+                    inner_vae = extractor.tokenizer.model.model
+                    if hasattr(inner_vae, "encoder") and not isinstance(
+                        inner_vae.encoder, torch._dynamo.eval_frame.OptimizedModule
+                    ):
+                        inner_vae.encoder = torch.compile(inner_vae.encoder, mode="default")
             return extractor, prompt
 
         elif self.config.backend == "cosmos3_edge":
@@ -314,6 +330,10 @@ class VideoVAMPolicy(PreTrainedPolicy):
         else:
             from .ltx_action import pool2_ltx_context
 
+            prompt = self.prompt_embedding
+            if prompt.shape[0] != 1:
+                raise ValueError("frozen prompt artifact must have batch size one")
+            extraction = self.extractor.extract(images, prompt, noise_seed=feature_seed)
             transform = self._ltx_context_transform
             if transform == "pool2":
                 context = pool2_ltx_context(extraction.hidden_grid)

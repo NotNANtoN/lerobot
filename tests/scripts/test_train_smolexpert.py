@@ -648,3 +648,113 @@ def test_online_backbone_dry_run(tmp_path: Path):
     cfg = json.loads((out_dir / "config.json").read_text())
     assert cfg["online_trained"] is True
     assert cfg["augmented"] is True
+
+
+def test_online_cosmos2b_dry_run(tmp_path: Path):
+    from scripts.video_vam.train_smolexpert import main as train_smolexpert_main
+
+    out_dir = tmp_path / "online_c2b_out"
+    val_dir = tmp_path / "val_cache_c2b"
+    val_dir.mkdir()
+    f_val = _create_mock_cache_item(
+        val_dir,
+        "val_0.safetensors",
+        context=torch.randn(2400, 2048),
+        state=torch.zeros(ACTION_DIM),
+        action=torch.zeros(ACTION_HORIZON, ACTION_DIM),
+        action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
+    )
+    val_m = val_dir / "manifest.json"
+    val_m.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"safetensors": f_val.name, "episode_index": 32, "frame_index": 0, "sample_id": "v0"}
+                ]
+            }
+        )
+    )
+
+    ret = train_smolexpert_main(
+        [
+            "--online-backbone",
+            "cosmos2b",
+            "--val-manifest",
+            str(val_m),
+            "--output-dir",
+            str(out_dir),
+            "--dry-run",
+            "--device",
+            "cpu",
+            "--augment",
+            "--max-steps",
+            "2",
+            "--val-every",
+            "1",
+            "--batch-size",
+            "2",
+            "--protocol",
+            "scale100",
+        ]
+    )
+    assert ret == 0
+    assert (out_dir / "best.safetensors").is_file()
+    cfg = json.loads((out_dir / "config.json").read_text())
+    assert cfg["backend"] == "cosmos"
+    assert cfg["online_trained"] is True
+    assert cfg["augmented"] is True
+
+
+def test_online_flux2_klein_dry_run(tmp_path: Path):
+    from scripts.video_vam.train_smolexpert import main as train_smolexpert_main
+
+    out_dir = tmp_path / "online_flux2_out"
+    val_dir = tmp_path / "val_cache_flux2"
+    val_dir.mkdir()
+    f_val = _create_mock_cache_item(
+        val_dir,
+        "val_0.safetensors",
+        context=torch.randn(256, 6144),
+        state=torch.zeros(ACTION_DIM),
+        action=torch.zeros(ACTION_HORIZON, ACTION_DIM),
+        action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
+    )
+    val_m = val_dir / "manifest.json"
+    val_m.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"safetensors": f_val.name, "episode_index": 32, "frame_index": 0, "sample_id": "v0"}
+                ]
+            }
+        )
+    )
+
+    ret = train_smolexpert_main(
+        [
+            "--online-backbone",
+            "flux2_klein",
+            "--val-manifest",
+            str(val_m),
+            "--output-dir",
+            str(out_dir),
+            "--dry-run",
+            "--device",
+            "cpu",
+            "--augment",
+            "--max-steps",
+            "2",
+            "--val-every",
+            "1",
+            "--batch-size",
+            "2",
+            "--protocol",
+            "scale100",
+        ]
+    )
+    assert ret == 0
+    assert (out_dir / "best.safetensors").is_file()
+    cfg = json.loads((out_dir / "config.json").read_text())
+    assert cfg["backend"] == "flux2_klein"
+    assert cfg["online_trained"] is True
+    assert cfg["augmented"] is True

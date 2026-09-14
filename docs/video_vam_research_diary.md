@@ -2030,4 +2030,53 @@ The codebase is being updated to enforce:
 - **Convergence Timeline**:
   - The augmented model found its optimal representation early (Step 12,500) and remained flat for 10,000 subsequent steps until the 20-evaluation patience limit triggered early stopping at Step 22,500.
   - On out-of-distribution Eval-Set 2 (eps 90–99), the augmented model reached `17.23°`, matching the static baseline (`17.20°`) despite continuous visual perturbation.
-- **Active Job**: `c3-online-aug-v1-train` is actively training on `abakus` across the clean historical V1 dataset (Stride 1, 4,688 windows) with dual evaluation active.
+- **Active Job**: `c3-online-aug-v1-train` completed 25,000 steps on `abakus` across the clean historical V1 dataset (Stride 1, 4,688 windows) with dual evaluation active.
+
+---
+
+## 2026-09-13 — Completed Cosmos 3 Online Augmentation Results & Launch of V2 Online Augmentation Queue (Cosmos 2B + FLUX.2 klein)
+
+### 1. Final Results: Cosmos 3 Edge Online Augmented on Clean V1 (`c3-online-aug-v1-train`)
+
+- **Run Artifact Directory**: `outputs/train/v1-cosmos3-edge-lora-online-aug-smolexpert`
+- **Execution Log**: `outputs/logs/c3_online_aug_v1_20260912_102933.log`
+- **Total Duration**: 47,918.1 seconds (~13.3 hours across 25,000 optimizer steps)
+- **Best Optimizer Step**: Step 16,500
+- **Final Dual-Evaluation Benchmark Performance (Best Step 16,500)**:
+  - **Eval-Set 1 (Historical Protocol 1.0, episodes 32–39, 88 anchors)**:
+    - **Trajectory RMSE**: **13.821**
+    - **Arm RMSE**: **14.396°**
+    - **Gripper RMSE**: **10.483**
+    - **Immediate H1**: **4.637**
+    - **First-5 (Mean)**: **6.258**
+    - **First-5 (Pooled)**: **6.349**
+    - **Validation Flow Loss**: 0.1621
+    - **Per-Joint RMSE (deg)**: `[17.329, 14.009, 14.251, 16.588, 7.840, 10.483]`
+  - **Eval-Set 2 (New Benchmark, episodes 90–99, 51 anchors)**:
+    - **Trajectory RMSE**: **24.657**
+    - **Arm RMSE**: **26.222°**
+    - **Gripper RMSE**: **14.487**
+    - **Immediate H1**: **9.995**
+    - **First-5 (Mean)**: **12.694**
+    - **First-5 (Pooled)**: **12.816**
+    - **Validation Flow Loss**: 0.9383
+    - **Per-Joint RMSE (deg)**: `[24.478, 23.166, 27.069, 31.559, 23.944, 14.487]`
+- **Scientific Findings**:
+  - Training on V1 with online data augmentations yields a highly competitive Eval-1 RMSE of **13.821**, outperforming the unaugmented base zero-shot baseline (14.26°).
+  - On out-of-distribution Eval-Set 2 (V2 held-out 90–99), the model trained solely on V1 demonstrations (episodes 0–31) achieves 24.657° RMSE, reflecting domain gap between V1 lighting/table setups and V2 demo distributions when new trajectories are absent during training.
+
+### 2. Multi-Backbone Online Augmentation Architecture & V2 Queue Launch
+
+To evaluate whether other world model backbones benefit from online dynamic augmentations when trained across the full 100-episode V2 dataset (`Orellius/cube_out_of_box_v2`), unified online extraction wrappers were implemented in `scripts/video_vam/train_smolexpert.py` for:
+
+1. **Cosmos 2B (T=2 mode)**: Observed prefix VAE (`state_t=2`), unpooled 2,400 tokens, Layer 20, with domain video-LoRA weights (`cosmos-video-lora-step6000`).
+2. **FLUX.2 [klein]**: Multi-reference conditioning (3 history frames + target), 256 junction tokens (6,144 channels).
+
+- **Queue Runner**: `scripts/video_vam/run_online_aug_v2_queue.sh`
+- **Execution Session**: Detached persistent tmux session `online_aug_v2_queue`
+- **Logging File**: `logs/online_aug_v2_queue.log`
+- **Dataset**: `Orellius/cube_out_of_box_v2` (82 training episodes: 0–31, 40–89; 9,122 temporal windows with stride 1)
+- **Pipeline Structure**:
+  - **Stage 1 (Active)**: Cosmos 2B ($T=2$ mode) SmolExpert with online data augmentations (`outputs/train/v2-cosmos2b-t2-online-aug-smolexpert`).
+  - **Stage 2 (Queued)**: FLUX.2 [klein] SmolExpert with online data augmentations (`outputs/train/v2-flux2-klein-online-aug-smolexpert`).
+- **Hardware Status**: Confirmed executing on NVIDIA GeForce RTX 4090 (PID 400939, ~13.3 GB VRAM, 97% GPU-Util, 360W power draw). Dual evaluation on unaugmented Eval-1 (88 anchors) and Eval-2 (51 anchors) active every 500 steps.

@@ -389,7 +389,7 @@ class Cosmos3ExtractorConfig(BaseExtractorConfig):
     compile_dit: bool = False
     compile_vae: bool = False
     dit_compile_mode: str = "default"
-    vae_compile_mode: str = "reduce-overhead"
+    vae_compile_mode: str = "default"
     extra_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

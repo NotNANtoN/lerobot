@@ -534,6 +534,12 @@ class CosmosPredict2Extractor:
                 mode=self.config.compile_mode,
                 fullgraph=True,
             )
+            if hasattr(self.tokenizer, "model") and hasattr(self.tokenizer.model, "model"):
+                inner_vae = self.tokenizer.model.model
+                if hasattr(inner_vae, "encoder") and not isinstance(
+                    inner_vae.encoder, torch._dynamo.eval_frame.OptimizedModule
+                ):
+                    inner_vae.encoder = torch.compile(inner_vae.encoder, mode="default")
 
     def _build_official_components(self) -> tuple[nn.Module, Any, tuple[str, ...]]:
         if self.device.type != "cuda":
