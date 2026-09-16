@@ -29,16 +29,20 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import sys
+import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 from torchvision.transforms import functional as tf_f
@@ -248,6 +252,195 @@ class UnifiedFeatureCacheDataset:
         )
 
 
+COSMOS3_CHECKPOINT_DIR = Path("/home/anton/.cache/video-vam/cosmos3-edge")
+COSMOS3_CACHE_BUILDER = "scripts/video_vam/extract_cosmos3_edge_pure_vision.py"
+
+
+def is_cosmos3(backbone: str | None) -> bool:
+    return backbone is not None and backbone.replace("-", "_").lower() in {"cosmos3", "cosmos3_edge"}
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return payload
+
+
+def _require_sha256(value: Any, source: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        raise ValueError(f"Missing or invalid SHA-256: {source}")
+    return value
+
+
+def cosmos3_eval_identity(
+    *,
+    checkpoint_path: Path,
+    lora_checkpoint: Path | None,
+    lora_rank: int,
+    lora_alpha: float,
+    hidden_layer: int,
+    prompt: str,
+) -> dict[str, Any]:
+    """Resolve current file identity without constructing a backbone or using a GPU."""
+    from lerobot.policies.vam.cosmos3_features import checkpoint_digest
+
+    checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+    transformer_dir = checkpoint_path / "transformer"
+    if not transformer_dir.is_dir():
+        transformer_dir = checkpoint_path
+    # The directory digest also includes JSON: metadata alone is not a backbone.
+    for component, directory in (("transformer", transformer_dir), ("VAE", checkpoint_path / "vae")):
+        if not any(
+            path.is_file() and path.stat().st_size > 0
+            for pattern in ("diffusion_pytorch_model*.safetensors", "diffusion_pytorch_model*.bin")
+            for path in directory.glob(pattern)
+        ):
+            raise FileNotFoundError(f"Cosmos3 checkpoint lacks nonempty {component} weights: {directory}")
+
+    if type(hidden_layer) is not int or not 1 <= hidden_layer <= 28 or not isinstance(prompt, str):
+        raise ValueError("Invalid Cosmos3 layer or prompt")
+    lora_sha = None
+    rank = None
+    alpha = None
+    if lora_checkpoint is not None:
+        lora_checkpoint = Path(lora_checkpoint).expanduser().resolve()
+        lora_sha = sha256_file(lora_checkpoint)
+        with safe_open(str(lora_checkpoint), framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+        # The loader gives safetensors metadata precedence over CLI values. Do not
+        # reproduce its silent fallback for malformed metadata in an identity check.
+        try:
+            rank = int(metadata.get("rank", lora_rank))
+            alpha = float(metadata.get("alpha", lora_alpha))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid Cosmos3 LoRA rank/alpha metadata: {lora_checkpoint}") from exc
+        if rank <= 0 or not math.isfinite(alpha) or alpha <= 0:
+            raise ValueError(f"Invalid Cosmos3 LoRA rank/alpha: {lora_checkpoint}")
+    return {
+        "backbone": "cosmos3-edge",
+        # This producer's legacy field is a directory digest, NOT the single
+        # transformer-file hash returned by Cosmos3FeatureExtractor.get_provenance().
+        "transformer_sha256": checkpoint_digest(checkpoint_path),
+        "lora_sha256": lora_sha,
+        "lora_rank": rank,
+        "lora_alpha": alpha,
+        "hidden_layer": hidden_layer,
+        "prompt": prompt,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "fps": 10.0,
+        "base_fps": 24.0,
+        "context_tokens": 600,
+        "context_dim": 2048,
+    }
+
+
+def _cosmos3_identity_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return cosmos3_eval_identity(
+        checkpoint_path=args.backbone_checkpoint or COSMOS3_CHECKPOINT_DIR,
+        lora_checkpoint=args.backbone_lora_weights,
+        lora_rank=args.backbone_lora_rank,
+        lora_alpha=args.backbone_lora_alpha,
+        hidden_layer=args.backbone_layer,
+        prompt=args.backbone_prompt,
+    )
+
+
+def validate_cosmos3_cache_identity(
+    payload: dict[str, Any], expected: dict[str, Any], *, source: str
+) -> None:
+    """Only the known, unaugmented pure-vision producer has supported cache semantics."""
+    provenance = payload.get("provenance")
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+        raise ValueError(f"Unsupported Cosmos3 cache schema: {source}")
+    if not isinstance(provenance, dict) or provenance.get("builder") != COSMOS3_CACHE_BUILDER:
+        raise ValueError(f"Unknown Cosmos3 pure-vision cache producer: {source}")
+    for key, value in expected.items():
+        if key not in provenance:
+            raise ValueError(f"Missing Cosmos3 cache identity field {key}: {source}")
+        actual = provenance[key]
+        valid_type = type(actual) is type(value) or (
+            isinstance(value, float) and type(actual) in (int, float)
+        )
+        if not valid_type or actual != value:
+            raise ValueError(
+                f"Cosmos3 cache identity mismatch for {key}: {source}; expected {value!r}, got {actual!r}"
+            )
+    if (
+        "lora_checkpoint" not in provenance
+        or (expected["lora_sha256"] is None and provenance["lora_checkpoint"] is not None)
+        or (
+            expected["lora_sha256"] is not None
+            and (not isinstance(provenance["lora_checkpoint"], str) or not provenance["lora_checkpoint"])
+        )
+    ):
+        raise ValueError(f"Missing or inconsistent Cosmos3 lora_checkpoint identity: {source}")
+    # Legacy schema 1 has no augmentation flag; its supported producer always
+    # extracts the unaugmented five-frame window. Never infer this for other builders.
+    for key in ("augment", "augmented"):
+        if key in provenance and provenance[key] is not False:
+            raise ValueError(f"Cosmos3 evaluation cache must be unaugmented ({key}): {source}")
+    if provenance.get("preprocessing_version", "cosmos3_native_v2") != "cosmos3_native_v2":
+        raise ValueError(f"Unknown Cosmos3 cache preprocessing: {source}")
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict) or runtime.get("dtype") != "bfloat16":
+        raise ValueError(f"Missing or mismatched Cosmos3 cache dtype: {source}")
+
+
+def load_cosmos3_eval_cache(
+    path: Path, expected: dict[str, Any], *, context_transform: str, split: str
+) -> UnifiedFeatureCacheDataset:
+    payload = _read_json_object(path)
+    validate_cosmos3_cache_identity(payload, expected, source=str(path))
+    dataset_metadata = payload.get("dataset", {})
+    if not isinstance(dataset_metadata, dict) or not all(
+        isinstance(dataset_metadata.get(k), str) and dataset_metadata[k] for k in ("repo_id", "revision")
+    ):
+        raise ValueError(f"Missing Cosmos3 cache dataset identity: {path}")
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"Cosmos3 evaluation cache requires nonempty entries: {path}")
+    episodes = range(32, 40) if split == "val" else range(90, 100)
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or type(entry.get("episode_index")) is not int
+            or entry["episode_index"] not in episodes
+        ):
+            raise ValueError(f"Invalid {split} episode in Cosmos3 cache: {path}")
+        if not isinstance(entry.get("sample_id"), str) or not entry["sample_id"]:
+            raise ValueError(f"Missing Cosmos3 evaluation sample_id: {path}")
+        _require_sha256(entry.get("safetensors_sha256"), str(path))
+    dataset = UnifiedFeatureCacheDataset(path, context_transform=context_transform)
+    if dataset.payload != payload:
+        raise ValueError(f"Cosmos3 manifest changed during validation: {path}")
+    for index in range(len(dataset)):
+        context = dataset[index].context
+        if tuple(context.shape) != (600, 2048) or context.dtype != torch.bfloat16:
+            raise ValueError(f"Cosmos3 cache context must be bfloat16 [600, 2048]: {path}")
+    return dataset
+
+
+def preflight_cosmos3_eval_caches(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, UnifiedFeatureCacheDataset]]:
+    paths = {"val": args.val_manifest, "eval2": args.eval2_manifest}
+    if not is_cosmos3(args.online_backbone) or not any(path is not None for path in paths.values()):
+        return None, {}
+    for path in paths.values():
+        if path is not None and not Path(path).is_file():
+            raise FileNotFoundError(f"Supplied Cosmos3 evaluation manifest not found: {path}")
+    identity = _cosmos3_identity_from_args(args)
+    datasets = {
+        split: load_cosmos3_eval_cache(
+            Path(path), identity, context_transform=args.context_transform, split=split
+        )
+        for split, path in paths.items()
+        if path is not None
+    }
+    return identity, datasets
+
+
 def compute_training_normalizer(
     train_dataset: UnifiedFeatureCacheDataset,
     train_episodes: Sequence[int],
@@ -409,6 +602,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
 def augment_temporal_window_gpu(
     batch_frames: Tensor,
     *,
+    spatial_crop: bool = False,
     p_blur: float = 0.3,
 ) -> Tensor:
     """Apply visually coherent data augmentation identically across all T=5 frames.
@@ -436,13 +630,18 @@ def augment_temporal_window_gpu(
         x_jitter = tf_f.adjust_saturation(x_jitter, s)
         x_jitter = tf_f.adjust_hue(x_jitter, h)
 
-        # 2. Spatial Translation / Crop of 4-6% (applied to all T frames identically)
-        crop_frac = random.uniform(0.94, 0.96)
-        crop_h = int(h_size * crop_frac)
-        crop_w = int(w_size * crop_frac)
-        top = random.randint(0, h_size - crop_h)
-        left = random.randint(0, w_size - crop_w)
-        x_crop = tf_f.resized_crop(x_jitter, top, left, crop_h, crop_w, size=[h_size, w_size], antialias=True)
+        # 2. Spatial Translation / Crop of 4-6% (applied only if requested)
+        if spatial_crop:
+            crop_frac = random.uniform(0.94, 0.96)
+            crop_h = int(h_size * crop_frac)
+            crop_w = int(w_size * crop_frac)
+            top = random.randint(0, h_size - crop_h)
+            left = random.randint(0, w_size - crop_w)
+            x_crop = tf_f.resized_crop(
+                x_jitter, top, left, crop_h, crop_w, size=[h_size, w_size], antialias=True
+            )
+        else:
+            x_crop = x_jitter
 
         # 3. Sensor Noise / Blur: low-probability mild Gaussian blur sigma in [0.1, 0.8]
         if random.random() < p_blur:
@@ -451,6 +650,55 @@ def augment_temporal_window_gpu(
 
         x_clamped = torch.clamp(x_crop, 0.0, 1.0)
         # Permute from [T, C, H, W] to [C, T, H, W] for VAM extractors
+        out.append(x_clamped.permute(1, 0, 2, 3))
+
+    return torch.stack(out, dim=0)
+
+
+def physics_augment_temporal_window_gpu(
+    batch_frames: Tensor,
+    *,
+    temp_range: tuple[float, float] = (-0.10, 0.10),
+    p_shadow: float = 0.5,
+    gamma_range: tuple[float, float] = (0.90, 1.10),
+) -> Tensor:
+    out: list[Tensor] = []
+    b_size, t_size, c_size, h_size, w_size = batch_frames.shape
+    device = batch_frames.device
+
+    for i in range(b_size):
+        x = (
+            batch_frames[i].float() / 255.0
+            if batch_frames[i].dtype == torch.uint8
+            else batch_frames[i].clone()
+        )
+
+        # 1. Planckian Illuminant Jitter (color temperature shift along Planckian locus)
+        temp = random.uniform(temp_range[0], temp_range[1])
+        scale = torch.tensor(
+            [1.0 + temp, 1.0 - 0.2 * temp, 1.0 - temp],
+            device=device,
+            dtype=x.dtype,
+        ).view(1, 3, 1, 1)
+        x = x * scale
+
+        # 2. Smooth Cast Shadow (p=0.5)
+        if random.random() < p_shadow:
+            opacity = random.uniform(0.20, 0.35)
+            x_start = random.randint(0, w_size // 3)
+            x_end = random.randint(w_size // 2, w_size)
+
+            mask = torch.ones((1, 1, h_size, w_size), device=device, dtype=x.dtype)
+            mask[:, :, :, x_start:x_end] = 1.0 - opacity
+            down = F.avg_pool2d(mask, kernel_size=16, stride=16)
+            mask = F.interpolate(down, size=(h_size, w_size), mode="bilinear", align_corners=False)
+            x = x * mask
+
+        # 3. Gamma / Auto-Exposure Variation
+        gamma = random.uniform(gamma_range[0], gamma_range[1])
+        x = torch.pow(torch.clamp(x, 1e-4, 1.0), gamma)
+
+        x_clamped = torch.clamp(x, 0.0, 1.0)
         out.append(x_clamped.permute(1, 0, 2, 3))
 
     return torch.stack(out, dim=0)
@@ -592,112 +840,157 @@ def evaluate_validation(
     if len(val_dataset) == 0:
         raise ValueError("Validation dataset contains no samples.")
 
+    cosmos3_cached = False
+    config = getattr(extractor, "config", None)
+    if (
+        config is not None
+        and is_cosmos3(getattr(config, "backbone_name", None))
+        and val_dataset[0].context is not None
+    ):
+        if (
+            len(config.hidden_layers) != 1
+            or config.fps != 10.0
+            or config.base_fps != 24.0
+            or config.dtype != "bfloat16"
+            or config.pool_spatial not in (None, 1)
+            or config.vae_path is not None
+        ):
+            raise ValueError("Unsupported Cosmos3 extractor configuration for cached evaluation")
+        identity = getattr(extractor, "_smolexpert_eval_identity", None)
+        if identity is None:
+            identity = cosmos3_eval_identity(
+                checkpoint_path=config.checkpoint_path,
+                lora_checkpoint=config.lora_checkpoint,
+                lora_rank=config.lora_rank,
+                lora_alpha=config.lora_alpha,
+                hidden_layer=config.hidden_layers[0],
+                prompt=config.prompt,
+            )
+            cast(Any, extractor)._smolexpert_eval_identity = identity
+        validate_cosmos3_cache_identity(
+            getattr(val_dataset, "payload", {}),
+            identity,
+            source=str(getattr(val_dataset, "manifest_path", "dataset")),
+        )
+        cosmos3_cached = True
+
     was_training = decoder.training
     decoder.eval()
 
-    squared_by_joint = torch.zeros(ACTION_DIM, dtype=torch.float64, device=device)
-    prefix_squared_by_step = [torch.zeros(ACTION_DIM, dtype=torch.float64, device=device) for _ in range(5)]
-    prefix_tokens_by_step = [0 for _ in range(5)]
+    try:
+        squared_by_joint = torch.zeros(ACTION_DIM, dtype=torch.float64, device=device)
+        prefix_squared_by_step = [
+            torch.zeros(ACTION_DIM, dtype=torch.float64, device=device) for _ in range(5)
+        ]
+        prefix_tokens_by_step = [0 for _ in range(5)]
 
-    valid_tokens_count = 0
-    flow_total = 0.0
-    flow_tokens = 0
+        valid_tokens_count = 0
+        flow_total = 0.0
+        flow_tokens = 0
 
-    max_action_dim = decoder.max_action_dim
-    dtype = (
-        decoder.action_in_proj.weight.dtype
-        if hasattr(decoder, "action_in_proj") and decoder.action_in_proj is not None
-        else torch.float32
-    )
-
-    dataset_id = getattr(val_dataset, "dataset_id", "default_dataset")
-
-    for start in range(0, len(val_dataset), batch_size):
-        end = min(start + batch_size, len(val_dataset))
-        batch_items = [val_dataset[i] for i in range(start, end)]
-
-        states = torch.stack([item.state for item in batch_items]).to(device=device, dtype=torch.float32)
-        actions = torch.stack([item.action for item in batch_items]).to(device=device, dtype=torch.float32)
-        if batch_items[0].context is not None:
-            contexts = torch.stack([item.context for item in batch_items]).to(device=device)
-        elif extractor is not None:
-            raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
-            rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                extracted_eval = []
-                for b_i in range(rgb_in.shape[0]):
-                    out_f = extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
-                    extracted_eval.append(out_f.features)
-                contexts = torch.cat(extracted_eval, dim=0).to(device=device)
-        else:
-            contexts = torch.randn(len(batch_items), 600, 2048, device=device)
-        paddings = torch.stack([item.action_is_pad for item in batch_items]).to(
-            device=device, dtype=torch.bool
+        max_action_dim = decoder.max_action_dim
+        dtype = (
+            decoder.action_in_proj.weight.dtype
+            if hasattr(decoder, "action_in_proj") and decoder.action_in_proj is not None
+            else torch.float32
         )
 
-        # 1. Deterministic per-sample seeded noise generation (Stable across reorder and batching)
-        sample_noises = []
-        sample_epsilons = []
-        sample_ts = []
-        for item in batch_items:
-            # Noise seed isolated per dataset_id + sample_id
-            s_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=0)
-            gen_noise = torch.Generator(device=device).manual_seed(s_seed)
-            n = torch.randn(
-                (1, ACTION_HORIZON, max_action_dim), device=device, dtype=dtype, generator=gen_noise
+        dataset_id = getattr(val_dataset, "dataset_id", "default_dataset")
+
+        for start in range(0, len(val_dataset), batch_size):
+            end = min(start + batch_size, len(val_dataset))
+            batch_items = [val_dataset[i] for i in range(start, end)]
+
+            states = torch.stack([item.state for item in batch_items]).to(device=device, dtype=torch.float32)
+            actions = torch.stack([item.action for item in batch_items]).to(
+                device=device, dtype=torch.float32
             )
-            sample_noises.append(n)
-
-            # Deterministic epsilon & t for flow-matching loss (Beta(1.5, 1.0) * 0.999 + 0.001)
-            eps_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=100_000)
-            gen_eps = torch.Generator(device=device).manual_seed(eps_seed)
-            eps = torch.randn(
-                (1, ACTION_HORIZON, max_action_dim), device=device, dtype=dtype, generator=gen_eps
+            if batch_items[0].context is not None:
+                contexts = torch.stack([item.context for item in batch_items]).to(device=device)
+                if cosmos3_cached and (
+                    tuple(contexts.shape[1:]) != (600, 2048) or contexts.dtype != torch.bfloat16
+                ):
+                    raise ValueError("Cosmos3 cache context must be bfloat16 [600, 2048]")
+            elif extractor is not None:
+                raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
+                rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    extracted_eval = []
+                    for b_i in range(rgb_in.shape[0]):
+                        out_f = extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
+                        extracted_eval.append(out_f.features)
+                    contexts = torch.cat(extracted_eval, dim=0).to(device=device)
+            else:
+                raise ValueError(
+                    "Evaluation requires cached context or an extractor; random features are forbidden"
+                )
+            paddings = torch.stack([item.action_is_pad for item in batch_items]).to(
+                device=device, dtype=torch.bool
             )
-            sample_epsilons.append(eps)
 
-            t_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=200_000)
-            gen_t = torch.Generator(device="cpu").manual_seed(t_seed)
-            u = torch.rand(1, generator=gen_t).item()
-            t_val = (u ** (2.0 / 3.0)) * 0.999 + 0.001
-            sample_ts.append(t_val)
+            # 1. Deterministic per-sample seeded noise generation (Stable across reorder and batching)
+            sample_noises = []
+            sample_epsilons = []
+            sample_ts = []
+            for item in batch_items:
+                # Noise seed isolated per dataset_id + sample_id
+                s_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=0)
+                gen_noise = torch.Generator(device=device).manual_seed(s_seed)
+                n = torch.randn(
+                    (1, ACTION_HORIZON, max_action_dim), device=device, dtype=dtype, generator=gen_noise
+                )
+                sample_noises.append(n)
 
-        noise = torch.cat(sample_noises, dim=0)
-        epsilon_tensor = torch.cat(sample_epsilons, dim=0)
-        t_tensor = torch.tensor(sample_ts, dtype=torch.float32, device=device)
+                # Deterministic epsilon & t for flow-matching loss (Beta(1.5, 1.0) * 0.999 + 0.001)
+                eps_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=100_000)
+                gen_eps = torch.Generator(device=device).manual_seed(eps_seed)
+                eps = torch.randn(
+                    (1, ACTION_HORIZON, max_action_dim), device=device, dtype=dtype, generator=gen_eps
+                )
+                sample_epsilons.append(eps)
 
-        # 2. Action sampling with explicit noise
-        pred_actions = decoder.sample_actions(states, contexts, noise=noise, num_steps=num_steps)
+                t_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=200_000)
+                gen_t = torch.Generator(device="cpu").manual_seed(t_seed)
+                u = torch.rand(1, generator=gen_t).item()
+                t_val = (u ** (2.0 / 3.0)) * 0.999 + 0.001
+                sample_ts.append(t_val)
 
-        # 3. Masked error accumulation
-        valid = (~paddings).unsqueeze(-1)  # [B, 30, 1]
-        valid_b = valid.squeeze(-1)  # [B, 30]
-        squared_err = (pred_actions.double() - actions.double()).square() * valid  # [B, 30, 6]
+            noise = torch.cat(sample_noises, dim=0)
+            epsilon_tensor = torch.cat(sample_epsilons, dim=0)
+            t_tensor = torch.tensor(sample_ts, dtype=torch.float32, device=device)
 
-        squared_by_joint += squared_err.sum(dim=(0, 1))
-        batch_valid_tokens = int(valid_b.sum().item())
-        valid_tokens_count += batch_valid_tokens
+            # 2. Action sampling with explicit noise
+            pred_actions = decoder.sample_actions(states, contexts, noise=noise, num_steps=num_steps)
 
-        # Step-by-step horizons for first 5 steps
-        for h in range(5):
-            vh = valid_b[:, h : h + 1].unsqueeze(-1)
-            prefix_squared_by_step[h] += (squared_err[:, h : h + 1] * vh).sum(dim=(0, 1))
-            prefix_tokens_by_step[h] += int(vh.sum().item())
+            # 3. Masked error accumulation
+            valid = (~paddings).unsqueeze(-1)  # [B, 30, 1]
+            valid_b = valid.squeeze(-1)  # [B, 30]
+            squared_err = (pred_actions.double() - actions.double()).square() * valid  # [B, 30, 6]
 
-        # 4. Explicit Flow-matching loss computation
-        flow_loss = decoder.flow_matching_loss(
-            state=states,
-            action=actions,
-            context=contexts,
-            t=t_tensor,
-            epsilon=epsilon_tensor,
-            action_is_pad=paddings,
-        )
-        flow_total += float(flow_loss.float().item()) * max(batch_valid_tokens, 1)
-        flow_tokens += max(batch_valid_tokens, 1)
+            squared_by_joint += squared_err.sum(dim=(0, 1))
+            batch_valid_tokens = int(valid_b.sum().item())
+            valid_tokens_count += batch_valid_tokens
 
-    if was_training:
-        decoder.train()
+            # Step-by-step horizons for first 5 steps
+            for h in range(5):
+                vh = valid_b[:, h : h + 1].unsqueeze(-1)
+                prefix_squared_by_step[h] += (squared_err[:, h : h + 1] * vh).sum(dim=(0, 1))
+                prefix_tokens_by_step[h] += int(vh.sum().item())
+
+            # 4. Explicit Flow-matching loss computation
+            flow_loss = decoder.flow_matching_loss(
+                state=states,
+                action=actions,
+                context=contexts,
+                t=t_tensor,
+                epsilon=epsilon_tensor,
+                action_is_pad=paddings,
+            )
+            flow_total += float(flow_loss.float().item()) * max(batch_valid_tokens, 1)
+            flow_tokens += max(batch_valid_tokens, 1)
+
+    finally:
+        decoder.train(was_training)
 
     valid_scalars = valid_tokens_count * ACTION_DIM
     if valid_scalars == 0:
@@ -920,10 +1213,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to precomputed prompt embedding for online backbone (e.g. Cosmos 2B t5-11b.safetensors).",
     )
     parser.add_argument(
+        "--compile-loss",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="torch.compile flow_matching_loss with mode='reduce-overhead' (CUDA graphs, default: True, 2.05x faster).",
+    )
+    parser.add_argument(
         "--augment",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable coherent visual data augmentations on 5-frame temporal window during training.",
+    )
+    parser.add_argument(
+        "--aug-strategy",
+        type=str,
+        choices=("physics", "legacy"),
+        default="physics",
+        help="Augmentation strategy when --augment is enabled: 'physics' (Planckian jitter + smooth cast shadow + gamma) or 'legacy' (naive color jitter + blur).",
+    )
+    parser.add_argument(
+        "--spatial-crop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply spatial translation/crop during visual augmentations (default: False, photometric only).",
     )
     parser.add_argument(
         "--dataset-repo-id",
@@ -972,6 +1284,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run evaluation only without training, loading trained model from --model-checkpoint or --checkpoint-path.",
     )
+    parser.add_argument(
+        "--eval-run-dir", type=Path, help="Reevaluate a completed online Cosmos3 run without modifying it."
+    )
+    parser.add_argument(
+        "--eval-report", type=Path, help="New, separate JSON report; existing paths are never overwritten."
+    )
+    parser.add_argument("--eval-checkpoint", choices=("best", "last"), default="best")
     parser.add_argument(
         "--model-checkpoint",
         type=Path,
@@ -1120,6 +1439,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Last-weight save interval in optimizer steps; <=0 saves only at end.",
     )
     args = parser.parse_args(argv)
+    if args.eval_run_dir is not None:
+        allowed = {
+            "--eval-run-dir",
+            "--eval-report",
+            "--eval-checkpoint",
+            "--eval-only",
+            "--val-manifest",
+            "--eval2-manifest",
+            "--device",
+            "--batch-size",
+        }
+        explicit = {
+            arg.split("=", 1)[0] for arg in (sys.argv[1:] if argv is None else argv) if arg.startswith("--")
+        }
+        if explicit - allowed:
+            parser.error(f"--eval-run-dir does not permit overrides: {sorted(explicit - allowed)}")
+        if args.eval_report is None:
+            parser.error("--eval-run-dir requires --eval-report")
+        args.eval_only = True
+        args.eval_batch_size_override = args.batch_size if "--batch-size" in explicit else None
+        return args
+    if args.eval_report is not None or args.eval_checkpoint != "best":
+        parser.error("--eval-report and --eval-checkpoint require --eval-run-dir")
     if args.output_dir is None:
         if args.eval_only:
             parser.error("--eval-only requires --output-dir")
@@ -1191,9 +1533,361 @@ def build_run_manifest(
     }
 
 
+def _restore_eval_run_args(manifest: dict[str, Any]) -> argparse.Namespace:
+    """Restore only head, feature, and evaluation settings; never training/output controls."""
+    saved = manifest.get("arguments")
+    if not isinstance(saved, dict):
+        raise ValueError("Run manifest is missing original arguments")
+    values: dict[str, Any] = {}
+    fields = {
+        "online_backbone": str,
+        "checkpoint_path": str,
+        "backbone_prompt": str,
+        "protocol": str,
+        "context_transform": str,
+        "backbone_layer": int,
+        "backbone_lora_rank": int,
+        "num_steps": int,
+        "seed": int,
+        "batch_size": int,
+    }
+    for name, expected_type in fields.items():
+        if type(saved.get(name)) is not expected_type:
+            raise ValueError(f"Missing or invalid saved run argument: {name}")
+        values[name] = saved[name]
+    alpha = cast(int | float, saved.get("backbone_lora_alpha"))
+    if type(alpha) not in (int, float) or not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("Missing or invalid saved run argument: backbone_lora_alpha")
+    values["backbone_lora_alpha"] = float(alpha)
+    repo_root = Path(__file__).resolve().parents[2]
+    for name in ("backbone_checkpoint", "backbone_lora_weights", "val_manifest", "eval2_manifest"):
+        if name not in saved or (
+            saved[name] is not None and (not isinstance(saved[name], str) or not saved[name])
+        ):
+            raise ValueError(f"Missing or invalid saved run argument: {name}")
+        path = Path(saved[name]).expanduser() if saved[name] is not None else None
+        values[name] = repo_root / path if path is not None and not path.is_absolute() else path
+    if (
+        not is_cosmos3(values["online_backbone"])
+        or values["protocol"] not in ("protocol1", "scale100")
+        or values["context_transform"] not in ("auto", "none", "pool2")
+        or values["num_steps"] <= 0
+        or values["batch_size"] <= 0
+    ):
+        raise ValueError("Isolated reevaluation requires a valid online Cosmos3 run configuration")
+    policy = manifest.get("policy", {})
+    if (
+        policy.get("type") != "SmolExpertActionDecoder"
+        or policy.get("action_dim") != ACTION_DIM
+        or policy.get("action_horizon") != ACTION_HORIZON
+        or policy.get("pretrained_source") != values["checkpoint_path"]
+        or policy.get("num_steps") != values["num_steps"]
+    ):
+        raise ValueError("Saved SmolExpert head architecture/source does not match run arguments")
+    checkpoint_source = Path(values["checkpoint_path"]).expanduser()
+    if (repo_root / checkpoint_source).exists():
+        values["checkpoint_path"] = str((repo_root / checkpoint_source).resolve())
+    return argparse.Namespace(**values)
+
+
+def _verified_run_artifact(run_dir: Path, record: Any, filename: str) -> tuple[Path, str]:
+    if not isinstance(record, dict) or record.get("path") != filename:
+        raise ValueError(f"Run manifest must record its own {filename}")
+    digest = _require_sha256(record.get("sha256"), filename)
+    path = run_dir / filename
+    if path.resolve().parent != run_dir:
+        raise ValueError(f"Run artifact must remain inside the source run: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"Recorded run artifact not found: {path}")
+    if sha256_file(path) != digest:
+        raise ValueError(f"SHA-256 mismatch for recorded run artifact: {path}")
+    return path, digest
+
+
+def verify_reevaluation_samples(
+    run_manifest: dict[str, Any], datasets: dict[str, UnifiedFeatureCacheDataset]
+) -> dict[str, Any]:
+    """Bind replacement data to the run's original, hash-verified ordered benchmarks."""
+    records = run_manifest.get("datasets")
+    if not isinstance(records, dict):
+        raise ValueError("Run manifest lacks original evaluation dataset records")
+    summary = {}
+    anchor_fields = ("sample_id", "episode_index", "frame_index", "window_indices")
+    for split in ("val", "eval2"):
+        record = records.get(split)
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("source_path_hint"), str)
+            or not record["source_path_hint"]
+        ):
+            raise ValueError(f"Missing original {split} manifest source_path_hint")
+        path = Path(record["source_path_hint"]).expanduser()
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parents[2] / path
+        path = path.resolve(strict=True)
+        digest = _require_sha256(record.get("manifest_sha256"), f"original {split} manifest")
+        contents = path.read_bytes()
+        if hashlib.sha256(contents).hexdigest() != digest:
+            raise ValueError(f"SHA-256 mismatch for original {split} manifest: {path}")
+        original_payload = json.loads(contents)
+        if not isinstance(original_payload, dict) or record.get("metadata") != {
+            key: value for key, value in original_payload.items() if key != "entries"
+        }:
+            raise ValueError(f"Original {split} manifest metadata does not match the run record")
+        replacement = datasets[split]
+        old_data = original_payload.get("dataset")
+        new_data = replacement.payload.get("dataset")
+        if (
+            not isinstance(old_data, dict)
+            or not isinstance(new_data, dict)
+            or not all(
+                isinstance(data.get(key), str) and data[key]
+                for data in (old_data, new_data)
+                for key in ("repo_id", "revision")
+            )
+        ):
+            raise ValueError(f"Missing original/replacement {split} dataset identity")
+        if {key: value for key, value in old_data.items() if key != "revision"} != {
+            key: value for key, value in new_data.items() if key != "revision"
+        } or replacement.dataset_id != old_data["repo_id"]:
+            raise ValueError(
+                f"Replacement {split} dataset identity changed; only revision metadata may differ"
+            )
+        if original_payload.get("subset") != replacement.payload.get("subset"):
+            raise ValueError(f"Replacement {split} subset metadata changed")
+        entries = original_payload.get("entries")
+        if not isinstance(entries, list) or not entries or len(entries) != len(replacement):
+            raise ValueError(f"Original/replacement {split} anchor counts differ or are missing")
+        original_file_hashes: dict[str, str] = {}
+        for index, (old_entry, new_entry) in enumerate(zip(entries, replacement.entries, strict=True)):
+            for entry in (old_entry, new_entry):
+                if (
+                    not isinstance(entry, dict)
+                    or not isinstance(entry.get("sample_id"), str)
+                    or not entry["sample_id"]
+                    or type(entry.get("episode_index")) is not int
+                    or type(entry.get("frame_index")) is not int
+                    or not isinstance(entry.get("window_indices"), list)
+                    or len(entry["window_indices"]) != 5
+                    or any(type(frame) is not int for frame in entry["window_indices"])
+                ):
+                    raise ValueError(f"Missing or invalid {split} anchor identity at position {index}")
+            if any(old_entry[key] != new_entry[key] for key in anchor_fields):
+                raise ValueError(f"Replacement {split} ordered anchor mismatch at position {index}")
+            artifact_hash = _require_sha256(
+                old_entry.get("safetensors_sha256"), f"original {split} artifact {index}"
+            )
+            filename = old_entry.get("safetensors")
+            if not isinstance(filename, str) or not filename:
+                raise ValueError(f"Missing original {split} artifact filename at position {index}")
+            if filename in original_file_hashes and original_file_hashes[filename] != artifact_hash:
+                raise ValueError(f"Conflicting original {split} artifact hashes: {filename}")
+            original_file_hashes[filename] = artifact_hash
+        original = UnifiedFeatureCacheDataset(path, context_transform=replacement.context_transform)
+        if original.payload != original_payload:
+            raise ValueError(f"Original {split} manifest changed during verification: {path}")
+        for index in range(len(original)):
+            old_item, new_item = original[index], replacement[index]
+            for field in ("state", "action", "action_is_pad"):
+                if not torch.equal(getattr(old_item, field), getattr(new_item, field)):
+                    raise ValueError(f"Replacement {split} {field} mismatch for {old_item.sample_id}")
+        summary[split] = {
+            "original_manifest": {"path": str(path), "sha256": digest},
+            "replacement_manifest": {
+                "path": str(replacement.manifest_path),
+                "sha256": sha256_file(replacement.manifest_path),
+            },
+            "dataset_id": old_data["repo_id"],
+            "samples_verified": len(original),
+            "ordered_anchor_fields": list(anchor_fields),
+            "ordered_anchors_equal": True,
+            "original_metadata_and_artifact_hashes_verified": True,
+            "labels_equal": dict.fromkeys(("state", "action", "action_is_pad"), True),
+            "revision_correction": {
+                "old": old_data["revision"],
+                "new": new_data["revision"],
+                "changed": old_data["revision"] != new_data["revision"],
+                "independently_verified": False,
+            },
+        }
+    return summary
+
+
+def write_new_eval_report(path: Path, payload: dict[str, Any]) -> None:
+    """Publish a complete JSON file atomically, without replacing even a racing writer."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Same-directory hard linking is atomic and fails if the destination exists,
+        # unlike rename/replace. It also refuses existing or dangling symlinks.
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def evaluate_saved_run(cli: argparse.Namespace) -> int:
+    """Evaluate verified caches with the original head/normalizer; write only a new report."""
+    run_dir = cli.eval_run_dir.expanduser().resolve(strict=True)
+    requested_report = cli.eval_report.expanduser().absolute()
+    if requested_report.exists() or requested_report.is_symlink():
+        raise FileExistsError(f"Evaluation report already exists: {requested_report}")
+    report = requested_report.parent.resolve(strict=True) / requested_report.name
+    if report.is_relative_to(run_dir):
+        raise ValueError("Evaluation report must be outside the source run directory")
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = _read_json_object(manifest_path)
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest["schema_version"] != 1
+        or manifest.get("status") != "completed"
+        or manifest.get("trainer") != "scripts/video_vam/train_smolexpert.py"
+    ):
+        raise ValueError("Isolated reevaluation requires a completed train_smolexpert run manifest")
+    manifest_sha = sha256_file(manifest_path)
+    args = _restore_eval_run_args(manifest)
+    for name in ("val_manifest", "eval2_manifest"):
+        override = getattr(cli, name)
+        if override is not None:
+            setattr(args, name, override.expanduser().resolve())
+        if getattr(args, name) is None:
+            raise ValueError(f"Isolated dual reevaluation requires an explicit {name} cache")
+    if cli.eval_batch_size_override is not None:
+        args.batch_size = cli.eval_batch_size_override
+    if args.batch_size <= 0:
+        raise ValueError("Evaluation batch size must be positive")
+    checkpoint_record = manifest.get("checkpoints", {}).get(cli.eval_checkpoint)
+    checkpoint, checkpoint_sha = _verified_run_artifact(
+        run_dir, checkpoint_record, f"{cli.eval_checkpoint}.safetensors"
+    )
+    normalizer_record = manifest.get("normalizer")
+    normalizer_path, normalizer_sha = _verified_run_artifact(
+        run_dir, normalizer_record, "normalizer.safetensors"
+    )
+    normalizer_record = cast(dict[str, Any], normalizer_record)
+    if normalizer_record.get("metadata", {}).get("source_split") != "train":
+        raise ValueError("Run normalizer must have recorded train-split provenance")
+    identity, datasets = preflight_cosmos3_eval_caches(args)
+    identity = cast(dict[str, Any], identity)
+    recorded_identity = manifest.get("online_feature_identity")
+    if recorded_identity is not None and recorded_identity != identity:
+        raise ValueError(
+            "Current Cosmos3 files do not match the online feature identity recorded by this run"
+        )
+    sample_verification = verify_reevaluation_samples(manifest, datasets)
+    norm_sd = load_file(str(normalizer_path), device="cpu")
+    normalizer = SmolVLANormalizer(
+        state_mean=norm_sd["state_mean"],
+        state_std=norm_sd["state_std"],
+        action_mean=norm_sd["action_mean"],
+        action_std=norm_sd["action_std"],
+        eps=1e-8,
+        source_split="train",
+    )
+    source_manifests = {
+        split: {
+            "path": str(dataset.manifest_path),
+            "sha256": sha256_file(dataset.manifest_path),
+            "dataset": dataset.payload["dataset"],
+            "dataset_revision_verified": False,
+            "samples": len(dataset),
+            "sample_ids": [entry["sample_id"] for entry in dataset.entries],
+            "episodes": sorted({entry["episode_index"] for entry in dataset.entries}),
+            "provenance": dataset.payload["provenance"],
+        }
+        for split, dataset in datasets.items()
+    }
+    device = torch.device(cli.device)
+    set_seed(args.seed)
+    decoder = SmolExpertActionDecoder.from_training_checkpoint(
+        checkpoint,
+        normalizer=normalizer,
+        expert_checkpoint=args.checkpoint_path,
+        device=device,
+        num_steps=args.num_steps,
+        input_channels=2048,
+    )
+    results = {}
+    for split, seed in (("val", args.seed), ("eval2", args.seed + 1000)):
+        results[split] = evaluate_validation(
+            decoder,
+            datasets[split],
+            device=device,
+            batch_size=args.batch_size,
+            num_steps=args.num_steps,
+            seed=seed,
+        )
+    original_val = manifest.get("datasets", {}).get("val", {}).get("metadata", {})
+    try:
+        validate_cosmos3_cache_identity(original_val, identity, source="original validation cache")
+        original_selection_matches = True
+    except ValueError:
+        original_selection_matches = False
+    limits = [
+        "Original checkpoint selection is unchanged; reevaluation does not reselect the best head or repair early stopping.",
+        "Revision corrections are reported, not independently authenticated against dataset snapshots. Ordered cached anchors and labels were verified against original manifests; RGB/video contents were not compared.",
+        "Original dirty training code cannot be reconstructed from its commit alone.",
+    ]
+    if recorded_identity is None:
+        limits.append(
+            "Historical online adapter digest was not recorded by the original trainer; current file hashes do not prove training-time identity."
+        )
+    if not original_selection_matches:
+        limits.append(
+            "Original best was selected using cached validation features whose identity does not match or cannot be verified against the current online backbone."
+        )
+    payload = {
+        "schema_version": 1,
+        "mode": "isolated_smolexpert_reevaluation",
+        "source_run": {"path": str(run_dir), "manifest_sha256": manifest_sha, "code": manifest.get("code")},
+        "code": code_identity(Path(__file__).resolve().parents[2]),
+        "checkpoint": {
+            **checkpoint_record,
+            "path": str(checkpoint),
+            "sha256": checkpoint_sha,
+            "role": cli.eval_checkpoint,
+        },
+        "normalizer": {
+            "path": str(normalizer_path),
+            "sha256": normalizer_sha,
+            "metadata": normalizer_record["metadata"],
+        },
+        "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        "device": str(device),
+        "backbone": args.online_backbone,
+        "protocol": args.protocol,
+        "current_backbone_identity": identity,
+        "evaluation_augmented": False,
+        "seeds": {"val": args.seed, "eval2": args.seed + 1000},
+        "source_manifests": source_manifests,
+        "sample_verification": sample_verification,
+        "original_selection_cache_matches_current_identity": original_selection_matches,
+        "eval1_historical": results["val"],
+        "eval2_new_benchmark": results["eval2"],
+        "limitations": limits,
+    }
+    write_new_eval_report(report, payload)
+    print(f"Reevaluation report written without modifying the source run: {report}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.eval_run_dir is not None:
+        return evaluate_saved_run(args)
+    if args.eval_only and is_cosmos3(args.online_backbone):
+        raise ValueError("Online Cosmos3 reevaluation requires --eval-run-dir and --eval-report")
+    cosmos3_identity, cosmos3_datasets = preflight_cosmos3_eval_caches(args)
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     set_seed(args.seed)
 
     effective_protocol = args.protocol
@@ -1258,17 +1952,8 @@ def main(argv: list[str] | None = None) -> int:
 
         # Auto-discover validation manifest if not explicitly given
         b_k = args.online_backbone.replace("-", "_").lower()
-        if args.val_manifest is None:
-            if "cosmos3" in b_k:
-                c15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/val/manifest.json")
-                c5 = Path("outputs/features/v2-cosmos3-edge-lora/val/manifest.json")
-                if c15.is_file():
-                    args.val_manifest = c15
-                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
-                elif c5.is_file():
-                    args.val_manifest = c5
-                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
-            elif any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
+        if args.val_manifest is None and not is_cosmos3(args.online_backbone):
+            if any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
                 c_c2b = Path("outputs/features/v2-cosmos2b-t2-undistilled/val/manifest.json")
                 if c_c2b.is_file():
                     args.val_manifest = c_c2b
@@ -1279,8 +1964,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.val_manifest = c_flux
                     print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
 
-        # Auto-discover Eval-Set 2 manifest if not explicitly given
-        if args.eval2_manifest is None:
+        # Cosmos3 cross-dataset eval2 must be explicit; never select another run's LoRA cache.
+        if args.eval2_manifest is None and not is_cosmos3(args.online_backbone):
             if args.val_manifest is not None:
                 val_p = Path(args.val_manifest).resolve()
                 cand = val_p.parent.parent / "eval2/manifest.json"
@@ -1288,16 +1973,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.eval2_manifest = str(cand)
                     print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
             if args.eval2_manifest is None:
-                if "cosmos3" in b_k:
-                    c2_15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/eval2/manifest.json")
-                    c2_5 = Path("outputs/features/v2-cosmos3-edge-lora/eval2/manifest.json")
-                    if c2_15.is_file():
-                        args.eval2_manifest = str(c2_15)
-                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
-                    elif c2_5.is_file():
-                        args.eval2_manifest = str(c2_5)
-                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
-                elif any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
+                if any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
                     c2_c2b = Path("outputs/features/v2-cosmos2b-t2-undistilled/eval2/manifest.json")
                     if c2_c2b.is_file():
                         args.eval2_manifest = str(c2_c2b)
@@ -1362,9 +2038,11 @@ def main(argv: list[str] | None = None) -> int:
     eval2_dataset: Any = None
     if args.eval2_manifest is not None and Path(args.eval2_manifest).is_file():
         print(f"  Eval-2 manifest: {args.eval2_manifest}")
-        eval2_dataset = UnifiedFeatureCacheDataset(
-            args.eval2_manifest, context_transform=args.context_transform
-        )
+        eval2_dataset = cosmos3_datasets.get("eval2")
+        if eval2_dataset is None:
+            eval2_dataset = UnifiedFeatureCacheDataset(
+                args.eval2_manifest, context_transform=args.context_transform
+            )
         print(f"Eval-Set 2 Verification PASSED ({len(eval2_dataset)} samples).")
     elif is_online and effective_protocol == "scale100":
         eval2_dataset = OnlineVideoDataset(
@@ -1379,7 +2057,11 @@ def main(argv: list[str] | None = None) -> int:
     # 2. Build Datasets
     val_dataset: Any = None
     if args.val_manifest is not None and Path(args.val_manifest).is_file():
-        val_dataset = UnifiedFeatureCacheDataset(args.val_manifest, context_transform=args.context_transform)
+        val_dataset = cosmos3_datasets.get("val")
+        if val_dataset is None:
+            val_dataset = UnifiedFeatureCacheDataset(
+                args.val_manifest, context_transform=args.context_transform
+            )
     elif is_online:
         val_dataset = OnlineVideoDataset(
             repo_id=args.dataset_repo_id,
@@ -1520,11 +2202,15 @@ def main(argv: list[str] | None = None) -> int:
                 lora_checkpoint=args.backbone_lora_weights,
                 lora_rank=args.backbone_lora_rank,
                 lora_alpha=args.backbone_lora_alpha,
+                compile_dit=True,
+                compile_vae=True,
+                vae_compile_mode="default",
             )
             print(
                 f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, lora: {args.backbone_lora_weights})..."
             )
             backbone_extractor = Cosmos3FeatureExtractor(b_cfg)
+            backbone_extractor._smolexpert_eval_identity = cosmos3_identity
             backbone_extractor.eval()
             for p in backbone_extractor.parameters():
                 p.requires_grad_(False)
@@ -1767,6 +2453,8 @@ def main(argv: list[str] | None = None) -> int:
     assert train_dataset is not None
 
     run_manifest = build_run_manifest(args, train_dataset, val_dataset, eval2_dataset, effective_protocol)
+    if cosmos3_identity is not None:
+        run_manifest["online_feature_identity"] = cosmos3_identity
     atomic_write_json(args.output_dir / "run_manifest.json", run_manifest)
 
     # 6. Optimizer & Scheduler
@@ -1805,6 +2493,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # 7. Training Loop with Exact Gradient Accumulation
+    if args.compile_loss and device.type == "cuda" and not args.dry_run:
+        compile_mode = "reduce-overhead" if args.grad_accum_steps == 1 else "default"
+        print(f"Compiling flow_matching_loss with mode='{compile_mode}'...", flush=True)
+        flow_matching_loss_fn = torch.compile(decoder.flow_matching_loss, mode=compile_mode)
+    else:
+        flow_matching_loss_fn = decoder.flow_matching_loss
     decoder.train()
     opt_step = 0
     indices = list(range(len(train_dataset)))
@@ -1843,7 +2537,12 @@ def main(argv: list[str] | None = None) -> int:
                     assert backbone_extractor is not None
                     raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
                     if args.augment:
-                        rgb_in = augment_temporal_window_gpu(raw_rgb)
+                        if getattr(args, "aug_strategy", "physics") == "physics":
+                            rgb_in = physics_augment_temporal_window_gpu(raw_rgb)
+                        else:
+                            rgb_in = augment_temporal_window_gpu(
+                                raw_rgb, spatial_crop=getattr(args, "spatial_crop", False)
+                            )
                     else:
                         rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
 
@@ -1864,7 +2563,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             # Flow matching loss with strict padding masking
-            loss = decoder.flow_matching_loss(
+            loss = flow_matching_loss_fn(
                 state=states,
                 action=actions,
                 context=contexts,

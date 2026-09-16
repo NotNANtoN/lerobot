@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from shutil import copyfile
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -594,37 +596,13 @@ def test_augment_temporal_window_gpu():
     assert 0.0 <= aug.min().item() <= aug.max().item() <= 1.0
 
 
-def test_online_backbone_dry_run(tmp_path: Path):
-    from scripts.video_vam.train_smolexpert import main as train_smolexpert_main
+def test_online_backbone_dry_run(cosmos3_assets, fake_online_dataset):
+    from scripts.video_vam import train_smolexpert as trainer
 
-    out_dir = tmp_path / "online_out"
-    val_dir = tmp_path / "val_cache"
-    val_dir.mkdir()
-    f_val = _create_mock_cache_item(
-        val_dir,
-        "val_0.safetensors",
-        context=torch.randn(600, 2048),
-        state=torch.zeros(ACTION_DIM),
-        action=torch.zeros(ACTION_HORIZON, ACTION_DIM),
-        action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
-    )
-    val_m = val_dir / "manifest.json"
-    val_m.write_text(
-        json.dumps(
-            {
-                "entries": [
-                    {"safetensors": f_val.name, "episode_index": 32, "frame_index": 0, "sample_id": "v0"}
-                ]
-            }
-        )
-    )
-
-    ret = train_smolexpert_main(
-        [
-            "--online-backbone",
-            "cosmos3_edge",
-            "--val-manifest",
-            str(val_m),
+    out_dir = cosmos3_assets.root / "online_out"
+    ret = trainer.main(
+        cosmos3_assets.argv
+        + [
             "--output-dir",
             str(out_dir),
             "--dry-run",
@@ -639,18 +617,20 @@ def test_online_backbone_dry_run(tmp_path: Path):
             "2",
             "--protocol",
             "scale100",
+            "--no-wandb",
         ]
     )
     assert ret == 0
     assert (out_dir / "best.safetensors").is_file()
     assert (out_dir / "normalizer.safetensors").is_file()
-    assert (out_dir / "config.json").is_file()
     cfg = json.loads((out_dir / "config.json").read_text())
     assert cfg["online_trained"] is True
     assert cfg["augmented"] is True
+    manifest = json.loads((out_dir / "run_manifest.json").read_text())
+    assert manifest["online_feature_identity"] == cosmos3_assets.identity
 
 
-def test_online_cosmos2b_dry_run(tmp_path: Path):
+def test_online_cosmos2b_dry_run(tmp_path: Path, fake_online_dataset):
     from scripts.video_vam.train_smolexpert import main as train_smolexpert_main
 
     out_dir = tmp_path / "online_c2b_out"
@@ -681,6 +661,8 @@ def test_online_cosmos2b_dry_run(tmp_path: Path):
             "cosmos2b",
             "--val-manifest",
             str(val_m),
+            "--eval2-manifest",
+            str(_synthetic_eval2_manifest(val_m)),
             "--output-dir",
             str(out_dir),
             "--dry-run",
@@ -705,7 +687,7 @@ def test_online_cosmos2b_dry_run(tmp_path: Path):
     assert cfg["augmented"] is True
 
 
-def test_online_flux2_klein_dry_run(tmp_path: Path):
+def test_online_flux2_klein_dry_run(tmp_path: Path, fake_online_dataset):
     from scripts.video_vam.train_smolexpert import main as train_smolexpert_main
 
     out_dir = tmp_path / "online_flux2_out"
@@ -736,6 +718,8 @@ def test_online_flux2_klein_dry_run(tmp_path: Path):
             "flux2_klein",
             "--val-manifest",
             str(val_m),
+            "--eval2-manifest",
+            str(_synthetic_eval2_manifest(val_m)),
             "--output-dir",
             str(out_dir),
             "--dry-run",
@@ -758,3 +742,930 @@ def test_online_flux2_klein_dry_run(tmp_path: Path):
     assert cfg["backend"] == "flux2_klein"
     assert cfg["online_trained"] is True
     assert cfg["augmented"] is True
+
+
+def _synthetic_eval2_manifest(val_manifest: Path) -> Path:
+    payload = json.loads(val_manifest.read_text())
+    for entry in payload["entries"]:
+        entry["episode_index"] = 90
+        entry["sample_id"] = "eval2-" + entry["sample_id"]
+    path = val_manifest.with_name("eval2.json")
+    path.write_text(json.dumps(payload))
+    return path
+
+
+@pytest.fixture
+def fake_online_dataset(monkeypatch):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    def initialize(self, repo_id, *, root=None, episodes, stride=1, contract=None):
+        self.repo_id = repo_id
+        self.episodes = tuple(episodes)
+        self.payload = {"source": "online_video_dataset", "episodes": list(episodes)}
+        self.manifest_path = Path("online:/synthetic")
+        self.items = [
+            trainer.OnlineVideoItem(
+                rgb=torch.zeros(5, 3, 4, 4, dtype=torch.uint8),
+                state=torch.full((ACTION_DIM,), float(i)),
+                action=torch.full((ACTION_HORIZON, ACTION_DIM), float(i)),
+                action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
+                sample_id=f"online-{i}",
+                episode_index=episodes[0],
+                frame_index=4 + i,
+            )
+            for i in range(2)
+        ]
+
+    monkeypatch.setattr(trainer.OnlineVideoDataset, "__init__", initialize)
+    monkeypatch.setattr(trainer.OnlineVideoDataset, "__len__", lambda self: len(self.items))
+    monkeypatch.setattr(trainer.OnlineVideoDataset, "__getitem__", lambda self, index: self.items[index])
+
+
+@pytest.fixture
+def cosmos3_assets(tmp_path):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    checkpoint = tmp_path / "backbone"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text('{"test_checkpoint": true}')
+    for component in ("transformer", "vae"):
+        directory = checkpoint / component
+        directory.mkdir()
+        save_file({"weight": torch.ones(1)}, str(directory / "diffusion_pytorch_model.safetensors"))
+    lora = tmp_path / "lora.safetensors"
+    save_file({"lora_A": torch.zeros(2, 2)}, str(lora), metadata={"rank": "2", "alpha": "4.0"})
+    argv = [
+        "--online-backbone",
+        "cosmos3_edge",
+        "--backbone-checkpoint",
+        str(checkpoint),
+        "--backbone-lora-weights",
+        str(lora),
+        "--backbone-layer",
+        "7",
+        "--backbone-prompt",
+        "saved non-default prompt",
+        "--device",
+        "cpu",
+    ]
+    args = trainer.parse_args(argv)
+    identity = trainer._cosmos3_identity_from_args(args)
+    paths = {}
+    for split, episode, frame in (("val", 32, 4820), ("eval2", 90, 11174)):
+        root = tmp_path / split
+        root.mkdir()
+        artifact = _create_mock_cache_item(
+            root,
+            "sample.safetensors",
+            context=torch.zeros(600, 2048, dtype=torch.bfloat16),
+            state=torch.ones(ACTION_DIM),
+            action=torch.ones(ACTION_HORIZON, ACTION_DIM),
+            action_is_pad=torch.tensor([False] * 28 + [True] * 2),
+        )
+        payload = {
+            "schema_version": 1,
+            "dataset": {"repo_id": "Orellius/cube_out_of_box_v2", "revision": "legacy-unverified-revision"},
+            "provenance": {
+                **identity,
+                "builder": trainer.COSMOS3_CACHE_BUILDER,
+                "lora_checkpoint": str(lora),
+            },
+            "runtime": {"dtype": "bfloat16"},
+            "entries": [
+                {
+                    "sample_id": f"episode-{episode:04d}-frame-{frame:06d}",
+                    "episode_index": episode,
+                    "frame_index": frame,
+                    "window_indices": list(range(frame - 4, frame + 1)),
+                    "safetensors": artifact.name,
+                    "safetensors_sha256": trainer.sha256_file(artifact),
+                }
+            ],
+        }
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps(payload))
+        paths[split] = manifest
+    argv += ["--val-manifest", str(paths["val"]), "--eval2-manifest", str(paths["eval2"])]
+    return SimpleNamespace(
+        root=tmp_path,
+        checkpoint=checkpoint,
+        lora=lora,
+        identity=identity,
+        argv=argv,
+        args=trainer.parse_args(argv),
+        paths=paths,
+    )
+
+
+def test_cosmos3_cache_matching_effective_adapter_metadata(cosmos3_assets):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    identity, datasets = trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)
+    assert cosmos3_assets.args.backbone_lora_rank == 16
+    assert cosmos3_assets.args.backbone_lora_alpha == 32.0
+    assert identity["lora_rank"] == 2
+    assert identity["lora_alpha"] == 4.0
+    assert set(datasets) == {"val", "eval2"}
+    assert datasets["val"][0].sample_id == "episode-0032-frame-004820"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lora_sha256", "b" * 64),
+        ("transformer_sha256", "c" * 64),
+        ("lora_rank", 16),
+        ("lora_alpha", 32.0),
+        ("hidden_layer", 20),
+        ("prompt", "different prompt"),
+        ("prompt_sha256", "d" * 64),
+        ("fps", 24.0),
+        ("base_fps", 10.0),
+        ("context_tokens", 2400),
+        ("context_dim", 4096),
+        ("backbone", "cosmos2b"),
+        ("builder", "unknown.py"),
+        ("augmented", True),
+        ("preprocessing_version", "unknown"),
+    ],
+)
+def test_cosmos3_cache_rejects_mismatched_identity(cosmos3_assets, field, value):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    path = cosmos3_assets.paths["eval2"]
+    payload = json.loads(path.read_text())
+    payload["provenance"][field] = value
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="Cosmos3"):
+        trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "lora_sha256",
+        "lora_checkpoint",
+        "lora_rank",
+        "lora_alpha",
+        "transformer_sha256",
+        "hidden_layer",
+        "prompt",
+        "prompt_sha256",
+        "fps",
+        "base_fps",
+        "context_tokens",
+        "context_dim",
+        "builder",
+    ],
+)
+def test_cosmos3_cache_rejects_missing_identity(cosmos3_assets, field):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    path = cosmos3_assets.paths["val"]
+    payload = json.loads(path.read_text())
+    del payload["provenance"][field]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="Cosmos3"):
+        trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)
+
+
+def test_cosmos3_base_cache_requires_explicit_no_adapter(cosmos3_assets):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    args = cosmos3_assets.args
+    args.backbone_lora_weights = None
+    with pytest.raises(ValueError, match="lora_sha256"):
+        trainer.preflight_cosmos3_eval_caches(args)
+    for path in cosmos3_assets.paths.values():
+        payload = json.loads(path.read_text())
+        for field in ("lora_checkpoint", "lora_sha256", "lora_rank", "lora_alpha"):
+            payload["provenance"][field] = None
+        path.write_text(json.dumps(payload))
+    identity, datasets = trainer.preflight_cosmos3_eval_caches(args)
+    assert identity["lora_sha256"] is None
+    assert len(datasets) == 2
+    args.backbone_lora_weights = cosmos3_assets.lora
+    with pytest.raises(ValueError, match="lora_sha256"):
+        trainer.preflight_cosmos3_eval_caches(args)
+
+
+@pytest.mark.parametrize("changed", ["checkpoint", "lora"])
+def test_cosmos3_cache_checks_current_files_not_paths(cosmos3_assets, changed):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    if changed == "checkpoint":
+        (cosmos3_assets.checkpoint / "config.json").write_text('{"changed": true}')
+    else:
+        save_file(
+            {"lora_A": torch.ones(2, 2)}, str(cosmos3_assets.lora), metadata={"rank": "2", "alpha": "4.0"}
+        )
+    with pytest.raises(ValueError, match="sha256"):
+        trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)
+
+
+def _unexpected(*args, **kwargs):
+    raise AssertionError("Unexpected training, mutation, download, or backbone initialization")
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "missing_manifest"])
+def test_cosmos3_preflight_before_writes_or_models(cosmos3_assets, monkeypatch, failure):
+    from lerobot.policies.vam import cosmos3_features
+    from scripts.video_vam import train_smolexpert as trainer
+
+    out = cosmos3_assets.root / "existing_run"
+    out.mkdir()
+    sentinel = out / "normalizer.safetensors"
+    sentinel.write_bytes(b"do not replace")
+    original_stat = sentinel.stat().st_mtime_ns
+    if failure == "missing_manifest":
+        cosmos3_assets.paths["eval2"].unlink()
+        error = FileNotFoundError
+    else:
+        path = cosmos3_assets.paths["eval2"]
+        payload = json.loads(path.read_text())
+        payload["provenance"]["lora_sha256"] = "f" * 64
+        path.write_text(json.dumps(payload))
+        error = ValueError
+    monkeypatch.setattr(trainer, "clean_own_artifacts", _unexpected)
+    monkeypatch.setattr(trainer, "compute_online_training_normalizer", _unexpected)
+    monkeypatch.setattr(trainer.OnlineVideoDataset, "__init__", _unexpected)
+    monkeypatch.setattr(cosmos3_features, "Cosmos3FeatureExtractor", _unexpected)
+    monkeypatch.setattr(trainer.SmolExpertActionDecoder, "from_pretrained", _unexpected)
+    with pytest.raises(error):
+        trainer.main(cosmos3_assets.argv + ["--output-dir", str(out), "--overwrite"])
+    assert list(out.iterdir()) == [sentinel]
+    assert sentinel.read_bytes() == b"do not replace"
+    assert sentinel.stat().st_mtime_ns == original_stat
+
+
+def test_cosmos3_no_caches_keeps_raw_eval_and_no_auto_discovery(tmp_path, monkeypatch):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    class RawDatasetReachedError(Exception):
+        pass
+
+    def raw_dataset(self, **kwargs):
+        assert kwargs["episodes"] == tuple(range(32, 40))
+        raise RawDatasetReachedError
+
+    monkeypatch.setattr(trainer, "_cosmos3_identity_from_args", _unexpected)
+    monkeypatch.setattr(trainer, "UnifiedFeatureCacheDataset", _unexpected)
+    monkeypatch.setattr(trainer.OnlineVideoDataset, "__init__", raw_dataset)
+    with pytest.raises(RawDatasetReachedError):
+        trainer.main(
+            ["--online-backbone", "cosmos3_edge", "--output-dir", str(tmp_path / "out"), "--device", "cpu"]
+        )
+
+
+def test_cosmos3_direct_cached_extractor_cannot_bypass_identity(cosmos3_assets):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    args = cosmos3_assets.args
+    config = SimpleNamespace(
+        backbone_name="cosmos3-edge",
+        checkpoint_path=args.backbone_checkpoint,
+        lora_checkpoint=args.backbone_lora_weights,
+        lora_rank=args.backbone_lora_rank,
+        lora_alpha=args.backbone_lora_alpha,
+        hidden_layers=(args.backbone_layer,),
+        prompt=args.backbone_prompt,
+        fps=10.0,
+        base_fps=24.0,
+        dtype="bfloat16",
+        pool_spatial=None,
+        vae_path=None,
+    )
+    extractor = SimpleNamespace(config=config, extract=_unexpected)
+    dataset = trainer.UnifiedFeatureCacheDataset(cosmos3_assets.paths["val"])
+    decoder = trainer.build_synthetic_tiny_decoder(input_channels=2048)
+    result = trainer.evaluate_validation(
+        decoder, dataset, extractor=extractor, device=torch.device("cpu"), num_steps=1
+    )
+    assert result["val_samples"] == 1
+    dataset.payload["provenance"]["lora_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="lora_sha256"):
+        trainer.evaluate_validation(decoder, dataset, extractor=extractor, device=torch.device("cpu"))
+    assert decoder.training
+
+
+def test_raw_validation_is_unaugmented_and_has_no_random_fallback(monkeypatch):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    rgb = torch.arange(5 * 3 * 4 * 4, dtype=torch.int64).remainder(256).to(torch.uint8).reshape(5, 3, 4, 4)
+    item = trainer.OnlineVideoItem(
+        rgb=rgb,
+        state=torch.zeros(ACTION_DIM),
+        action=torch.zeros(ACTION_HORIZON, ACTION_DIM),
+        action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
+        sample_id="original-id",
+        episode_index=32,
+        frame_index=4820,
+    )
+    frames = []
+
+    def extract(*, rgb_frames):
+        frames.append(rgb_frames.clone())
+        return SimpleNamespace(features=torch.zeros(1, 4, 16))
+
+    monkeypatch.setattr(trainer, "augment_temporal_window_gpu", _unexpected)
+    decoder = trainer.build_synthetic_tiny_decoder(input_channels=16)
+    rng = torch.get_rng_state()
+    trainer.evaluate_validation(
+        decoder, [item], extractor=SimpleNamespace(extract=extract), device=torch.device("cpu"), num_steps=1
+    )
+    torch.testing.assert_close(frames[0], rgb.float().permute(1, 0, 2, 3).unsqueeze(0) / 255)
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert decoder.training
+    with pytest.raises(ValueError, match="random features are forbidden"):
+        trainer.evaluate_validation(decoder, [item], device=torch.device("cpu"))
+    assert decoder.training
+
+
+@pytest.fixture
+def saved_cosmos3_run(cosmos3_assets, monkeypatch):
+    from lerobot.policies.vam import cosmos3_features
+    from scripts.video_vam import train_smolexpert as trainer
+
+    run = cosmos3_assets.root / "original_run"
+    run.mkdir()
+    normalizer = SmolVLANormalizer(
+        state_mean=torch.full((ACTION_DIM,), 3.0),
+        state_std=torch.ones(ACTION_DIM),
+        action_mean=torch.full((ACTION_DIM,), 4.0),
+        action_std=torch.ones(ACTION_DIM),
+    )
+    norm = run / "normalizer.safetensors"
+    save_file(normalizer.state_dict(), str(norm))
+    decoder = trainer.build_synthetic_tiny_decoder(input_channels=2048, normalizer=normalizer)
+    checkpoints = {}
+    for role in ("best", "last"):
+        path = run / f"{role}.safetensors"
+        save_file(decoder.state_dict(), str(path))
+        checkpoints[role] = {
+            "path": path.name,
+            "sha256": trainer.sha256_file(path),
+            "optimizer_step": 12500 if role == "best" else 22500,
+        }
+        with torch.no_grad():
+            decoder.context_adapter.projection.weight.add_(0.1)
+    saved = {k: str(v) if isinstance(v, Path) else v for k, v in vars(cosmos3_assets.args).items()}
+    saved.update(
+        {
+            "seed": 42,
+            "num_steps": 2,
+            "batch_size": 1,
+            "overwrite": True,
+            "normalizer_path": "/must-not-use-external-normalizer",
+            "output_dir": str(run),
+            "augment": True,
+        }
+    )
+    original_records = {}
+    for split, replacement_path in cosmos3_assets.paths.items():
+        original_payload = json.loads(replacement_path.read_text())
+        original_payload["provenance"]["lora_sha256"] = "b" * 64
+        original_dir = cosmos3_assets.root / f"original-{split}-cache"
+        original_dir.mkdir()
+        for entry in original_payload["entries"]:
+            copyfile(replacement_path.parent / entry["safetensors"], original_dir / entry["safetensors"])
+        original_path = original_dir / "manifest.json"
+        original_path.write_text(json.dumps(original_payload))
+        original_records[split] = {
+            "source_path_hint": str(original_path),
+            "manifest_sha256": trainer.sha256_file(original_path),
+            "metadata": {key: value for key, value in original_payload.items() if key != "entries"},
+        }
+    manifest = {
+        "schema_version": 1,
+        "status": "completed",
+        "trainer": "scripts/video_vam/train_smolexpert.py",
+        "code": {"commit": "original-commit", "dirty": True},
+        "arguments": saved,
+        "policy": {
+            "type": "SmolExpertActionDecoder",
+            "pretrained_source": saved["checkpoint_path"],
+            "action_dim": ACTION_DIM,
+            "action_horizon": ACTION_HORIZON,
+            "num_steps": saved["num_steps"],
+        },
+        "normalizer": {
+            "path": norm.name,
+            "sha256": trainer.sha256_file(norm),
+            "metadata": {"source_split": "train"},
+        },
+        "checkpoints": checkpoints,
+        "datasets": original_records,
+    }
+    (run / "run_manifest.json").write_text(json.dumps(manifest))
+    (run / "metrics.jsonl").write_text("original metrics\n")
+    loaded = []
+
+    def tiny_pretrained(cls, checkpoint, *, normalizer, device, **kwargs):
+        loaded.append({"checkpoint": checkpoint, "normalizer": normalizer, "kwargs": kwargs})
+        assert str(device) == "cpu"
+        model = trainer.build_synthetic_tiny_decoder(
+            input_channels=kwargs["input_channels"], normalizer=normalizer
+        )
+        model.num_steps = kwargs["num_steps"]
+        return model
+
+    # Exercise the real from_training_checkpoint/load_training_checkpoint strict loader,
+    # mocking only the initial pretrained architecture construction/download.
+    monkeypatch.setattr(trainer.SmolExpertActionDecoder, "from_pretrained", classmethod(tiny_pretrained))
+    monkeypatch.setattr(cosmos3_features, "Cosmos3FeatureExtractor", _unexpected)
+    monkeypatch.setattr(trainer.OnlineVideoDataset, "__init__", _unexpected)
+    for name in (
+        "compute_online_training_normalizer",
+        "compute_training_normalizer",
+        "clean_own_artifacts",
+        "save_weights_artifact",
+        "build_run_manifest",
+        "build_scheduler",
+    ):
+        monkeypatch.setattr(trainer, name, _unexpected)
+    monkeypatch.setattr(trainer.torch.optim, "AdamW", _unexpected)
+    monkeypatch.setattr(trainer, "code_identity", lambda root: {"commit": "reeval-commit", "dirty": True})
+    return SimpleNamespace(
+        run=run,
+        manifest=manifest,
+        assets=cosmos3_assets,
+        loaded=loaded,
+        report=cosmos3_assets.root / "new-report.json",
+    )
+
+
+def _source_snapshot(run):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    return {
+        str(path.relative_to(run)): (trainer.sha256_file(path), path.stat().st_mtime_ns)
+        for path in run.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("role", ["best", "last"])
+def test_isolated_reeval_preserves_sources_hashes_args_and_seeds(saved_cosmos3_run, monkeypatch, role):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    before = _source_snapshot(setup.run)
+    evaluate = trainer.evaluate_validation
+    calls = []
+
+    def spy(decoder, dataset, **kwargs):
+        calls.append((kwargs["seed"], kwargs["num_steps"], [e["sample_id"] for e in dataset.entries]))
+        assert kwargs.get("extractor") is None
+        return evaluate(decoder, dataset, **kwargs)
+
+    monkeypatch.setattr(trainer, "evaluate_validation", spy)
+    assert (
+        trainer.main(
+            [
+                "--eval-run-dir",
+                str(setup.run),
+                "--eval-report",
+                str(setup.report),
+                "--eval-checkpoint",
+                role,
+                "--device",
+                "cpu",
+            ]
+        )
+        == 0
+    )
+    assert _source_snapshot(setup.run) == before
+    report = json.loads(setup.report.read_text())
+    assert report["checkpoint"]["role"] == role
+    assert report["checkpoint"]["sha256"] == setup.manifest["checkpoints"][role]["sha256"]
+    assert report["normalizer"]["sha256"] == setup.manifest["normalizer"]["sha256"]
+    assert report["source_run"]["manifest_sha256"] == before["run_manifest.json"][0]
+    assert report["current_backbone_identity"] == setup.assets.identity
+    assert report["code"] == {"commit": "reeval-commit", "dirty": True}
+    assert report["seeds"] == {"val": 42, "eval2": 1042}
+    assert [c[:2] for c in calls] == [(42, 2), (1042, 2)]
+    assert calls[0][2] == ["episode-0032-frame-004820"]
+    assert calls[1][2] == ["episode-0090-frame-011174"]
+    assert report["arguments"]["backbone_layer"] == 7
+    assert report["arguments"]["backbone_prompt"] == "saved non-default prompt"
+    assert "overwrite" not in report["arguments"]
+    assert report["evaluation_augmented"] is False
+    assert report["source_manifests"]["eval2"]["dataset_revision_verified"] is False
+    assert report["source_manifests"]["val"]["sha256"] == trainer.sha256_file(setup.assets.paths["val"])
+    verified = report["sample_verification"]
+    for split in ("val", "eval2"):
+        assert verified[split]["samples_verified"] == 1
+        assert (
+            verified[split]["original_manifest"]["sha256"]
+            == setup.manifest["datasets"][split]["manifest_sha256"]
+        )
+        assert verified[split]["ordered_anchors_equal"] is True
+        assert all(verified[split]["labels_equal"].values())
+        assert verified[split]["original_metadata_and_artifact_hashes_verified"] is True
+        assert verified[split]["revision_correction"]["changed"] is False
+    assert report["original_selection_cache_matches_current_identity"] is False
+    assert any("Historical online adapter digest" in limit for limit in report["limitations"])
+    assert any("Original best" in limit for limit in report["limitations"])
+    assert setup.loaded[0]["kwargs"] == {
+        "num_steps": 2,
+        "input_channels": 2048,
+        "vlm_config_name": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+    }
+    assert torch.equal(setup.loaded[0]["normalizer"].state_mean, torch.full((ACTION_DIM,), 3.0))
+    with pytest.raises(FileExistsError):
+        trainer.main(
+            ["--eval-run-dir", str(setup.run), "--eval-report", str(setup.report), "--device", "cpu"]
+        )
+    assert _source_snapshot(setup.run) == before
+
+
+@pytest.mark.parametrize(
+    ("artifact", "failure"),
+    [
+        ("best", "missing"),
+        ("last", "missing"),
+        ("best", "hash"),
+        ("normalizer", "missing"),
+        ("normalizer", "hash"),
+    ],
+)
+def test_isolated_reeval_requires_recorded_own_artifacts(saved_cosmos3_run, artifact, failure):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    path = setup.run / f"{artifact}.safetensors"
+    if failure == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"corrupted")
+    before = _source_snapshot(setup.run)
+    with pytest.raises((FileNotFoundError, ValueError)):
+        trainer.main(
+            [
+                "--eval-run-dir",
+                str(setup.run),
+                "--eval-report",
+                str(setup.report),
+                "--eval-checkpoint",
+                "last" if artifact == "last" else "best",
+                "--device",
+                "cpu",
+            ]
+        )
+    assert not setup.loaded
+    assert not setup.report.exists()
+    assert _source_snapshot(setup.run) == before
+
+
+def test_isolated_reeval_validates_explicit_cache_overrides(saved_cosmos3_run):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    manifest_path = setup.run / "run_manifest.json"
+    setup.manifest["arguments"]["val_manifest"] = "/missing-original-cache"
+    manifest_path.write_text(json.dumps(setup.manifest))
+    before = _source_snapshot(setup.run)
+    assert (
+        trainer.main(
+            [
+                "--eval-run-dir",
+                str(setup.run),
+                "--eval-report",
+                str(setup.report),
+                "--val-manifest",
+                str(setup.assets.paths["val"]),
+                "--eval2-manifest",
+                str(setup.assets.paths["eval2"]),
+                "--device",
+                "cpu",
+            ]
+        )
+        == 0
+    )
+    assert _source_snapshot(setup.run) == before
+    payload = json.loads(setup.assets.paths["eval2"].read_text())
+    payload["provenance"]["lora_sha256"] = "0" * 64
+    setup.assets.paths["eval2"].write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="lora_sha256"):
+        trainer.main(
+            [
+                "--eval-run-dir",
+                str(setup.run),
+                "--eval-report",
+                str(setup.report.with_name("bad.json")),
+                "--val-manifest",
+                str(setup.assets.paths["val"]),
+                "--device",
+                "cpu",
+            ]
+        )
+    assert not setup.report.with_name("bad.json").exists()
+    assert len(setup.loaded) == 1
+
+
+@pytest.mark.parametrize("unsafe", ["inside_run", "dangling_symlink"])
+def test_isolated_reeval_rejects_unsafe_report_paths(saved_cosmos3_run, unsafe):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    report = setup.run / "new.json" if unsafe == "inside_run" else setup.report
+    if unsafe == "dangling_symlink":
+        report.symlink_to(setup.assets.root / "does-not-exist")
+    before = _source_snapshot(setup.run)
+    with pytest.raises((ValueError, FileExistsError)):
+        trainer.main(["--eval-run-dir", str(setup.run), "--eval-report", str(report), "--device", "cpu"])
+    assert not setup.loaded
+    assert _source_snapshot(setup.run) == before
+
+
+def test_eval_report_publication_is_atomic_no_clobber(tmp_path, monkeypatch):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    report = tmp_path / "report.json"
+    link = trainer.os.link
+
+    def racing_link(source, destination):
+        destination.write_text("other writer")
+        link(source, destination)
+
+    monkeypatch.setattr(trainer.os, "link", racing_link)
+    with pytest.raises(FileExistsError):
+        trainer.write_new_eval_report(report, {"complete": True})
+    assert report.read_text() == "other writer"
+    assert list(tmp_path.iterdir()) == [report]
+
+
+def test_eval_run_cli_requires_report_and_disallows_training_overrides(tmp_path):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    base = [
+        "--eval-run-dir",
+        str(tmp_path),
+        "--eval-report",
+        str(tmp_path / "report.json"),
+        "--device",
+        "cpu",
+    ]
+    args = trainer.parse_args(base)
+    assert args.eval_only and args.output_dir is None and args.eval_checkpoint == "best"
+    for extra in (
+        ["--overwrite"],
+        ["--output-dir", "other"],
+        ["--model-checkpoint", "other"],
+        ["--seed", "0"],
+        ["--dry-run"],
+    ):
+        with pytest.raises(SystemExit):
+            trainer.parse_args(base + extra)
+    with pytest.raises(SystemExit):
+        trainer.parse_args(["--eval-run-dir", str(tmp_path)])
+
+
+@pytest.mark.parametrize(("field", "value"), [("rank", "invalid"), ("alpha", "nan"), ("alpha", "0")])
+def test_cosmos3_identity_rejects_malformed_adapter_metadata(cosmos3_assets, field, value):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    metadata = {"rank": "2", "alpha": "4.0", field: value}
+    save_file({"lora_A": torch.zeros(2, 2)}, str(cosmos3_assets.lora), metadata=metadata)
+    with pytest.raises(ValueError, match="rank/alpha"):
+        trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)
+
+
+@pytest.mark.parametrize(
+    "failure", ["seed_type", "missing_checkpoint_record", "recorded_feature_identity", "head_keys"]
+)
+def test_isolated_reeval_fails_closed_on_invalid_run(saved_cosmos3_run, failure):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    if failure == "seed_type":
+        setup.manifest["arguments"]["seed"] = "42"
+    elif failure == "missing_checkpoint_record":
+        del setup.manifest["checkpoints"]["best"]
+    elif failure == "recorded_feature_identity":
+        setup.manifest["online_feature_identity"] = {**setup.assets.identity, "lora_sha256": "f" * 64}
+    else:
+        path = setup.run / "best.safetensors"
+        save_file({"unexpected_key": torch.ones(1)}, str(path))
+        setup.manifest["checkpoints"]["best"]["sha256"] = trainer.sha256_file(path)
+    (setup.run / "run_manifest.json").write_text(json.dumps(setup.manifest))
+    before = _source_snapshot(setup.run)
+    with pytest.raises(ValueError):
+        trainer.main(
+            ["--eval-run-dir", str(setup.run), "--eval-report", str(setup.report), "--device", "cpu"]
+        )
+    assert not setup.report.exists()
+    assert _source_snapshot(setup.run) == before
+    assert len(setup.loaded) == (1 if failure == "head_keys" else 0)
+
+
+def test_isolated_reeval_rejects_external_normalizer_symlink(saved_cosmos3_run):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    path = setup.run / "normalizer.safetensors"
+    outside = setup.assets.root / "external-normalizer.safetensors"
+    path.rename(outside)
+    path.symlink_to(outside)
+    before = _source_snapshot(setup.run)
+    with pytest.raises(ValueError, match="inside the source run"):
+        trainer.main(
+            ["--eval-run-dir", str(setup.run), "--eval-report", str(setup.report), "--device", "cpu"]
+        )
+    assert _source_snapshot(setup.run) == before
+    assert not setup.loaded
+    assert not setup.report.exists()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "sample_id",
+        "episode_index",
+        "frame_index",
+        "window_indices",
+        "repo_id",
+        "state",
+        "action",
+        "action_is_pad",
+    ],
+)
+def test_reeval_rejects_changed_benchmark_before_model(saved_cosmos3_run, change):
+    from safetensors.torch import load_file
+
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    path = setup.assets.paths["val"]
+    payload = json.loads(path.read_text())
+    entry = payload["entries"][0]
+    if change == "sample_id":
+        entry[change] += "-changed"
+    elif change in ("episode_index", "frame_index"):
+        entry[change] += 1
+    elif change == "window_indices":
+        entry[change][0] += 1
+    elif change == "repo_id":
+        payload["dataset"][change] = "different/noise-seed-identity"
+    else:
+        artifact = path.parent / entry["safetensors"]
+        tensors = load_file(str(artifact))
+        key = "target_action" if change == "action" and "target_action" in tensors else change
+        if change == "action_is_pad":
+            tensors[key][0] = True
+        else:
+            tensors[key].view(-1)[0] += 0.25
+        save_file(tensors, str(artifact))
+        entry["safetensors_sha256"] = trainer.sha256_file(artifact)
+    path.write_text(json.dumps(payload))
+    before = _source_snapshot(setup.run)
+    with pytest.raises(
+        ValueError,
+        match="(ordered anchor mismatch|dataset identity changed|state mismatch|action mismatch|action_is_pad mismatch)",
+    ):
+        trainer.main(
+            ["--eval-run-dir", str(setup.run), "--eval-report", str(setup.report), "--device", "cpu"]
+        )
+    assert not setup.loaded
+    assert not setup.report.exists()
+    assert _source_snapshot(setup.run) == before
+
+
+def test_reeval_rejects_changed_anchor_order(saved_cosmos3_run):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    record = setup.manifest["datasets"]["val"]
+    original_path = Path(record["source_path_hint"])
+    for path in (original_path, setup.assets.paths["val"]):
+        payload = json.loads(path.read_text())
+        second = dict(payload["entries"][0])
+        second["sample_id"] += "-second"
+        second["frame_index"] += 20
+        second["window_indices"] = [frame + 20 for frame in second["window_indices"]]
+        payload["entries"].append(second)
+        if path != original_path:
+            payload["entries"].reverse()
+        path.write_text(json.dumps(payload))
+    record["manifest_sha256"] = trainer.sha256_file(original_path)
+    (setup.run / "run_manifest.json").write_text(json.dumps(setup.manifest))
+    with pytest.raises(ValueError, match="ordered anchor mismatch"):
+        trainer.main(
+            ["--eval-run-dir", str(setup.run), "--eval-report", str(setup.report), "--device", "cpu"]
+        )
+    assert not setup.loaded
+    assert not setup.report.exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_record",
+        "missing_manifest",
+        "manifest_hash",
+        "metadata",
+        "missing_artifact",
+        "artifact_hash",
+        "missing_artifact_hash",
+    ],
+)
+def test_reeval_requires_verifiable_original_benchmark(saved_cosmos3_run, failure):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    record = setup.manifest["datasets"]["eval2"]
+    path = Path(record["source_path_hint"])
+    payload = json.loads(path.read_text())
+    artifact = path.parent / payload["entries"][0]["safetensors"]
+    if failure == "missing_record":
+        del setup.manifest["datasets"]["eval2"]
+    elif failure == "missing_manifest":
+        path.unlink()
+    elif failure == "manifest_hash":
+        record["manifest_sha256"] = "0" * 64
+    elif failure == "metadata":
+        record["metadata"]["dataset"]["repo_id"] = "different/recorded-metadata"
+    elif failure == "missing_artifact":
+        artifact.unlink()
+    elif failure == "artifact_hash":
+        artifact.write_bytes(b"corrupt original cache")
+    else:
+        del payload["entries"][0]["safetensors_sha256"]
+        path.write_text(json.dumps(payload))
+        record["manifest_sha256"] = trainer.sha256_file(path)
+    (setup.run / "run_manifest.json").write_text(json.dumps(setup.manifest))
+    before = _source_snapshot(setup.run)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        trainer.main(
+            ["--eval-run-dir", str(setup.run), "--eval-report", str(setup.report), "--device", "cpu"]
+        )
+    assert not setup.loaded
+    assert not setup.report.exists()
+    assert _source_snapshot(setup.run) == before
+
+
+def test_reeval_allows_only_revision_correction_and_reports_it(saved_cosmos3_run):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    setup = saved_cosmos3_run
+    path = setup.assets.paths["eval2"]
+    payload = json.loads(path.read_text())
+    old_revision = payload["dataset"]["revision"]
+    payload["dataset"]["revision"] = "5d0325cc1412f4774223a0beb528958108814962"
+    path.write_text(json.dumps(payload))
+    assert (
+        trainer.main(
+            ["--eval-run-dir", str(setup.run), "--eval-report", str(setup.report), "--device", "cpu"]
+        )
+        == 0
+    )
+    report = json.loads(setup.report.read_text())
+    verified = report["sample_verification"]["eval2"]
+    assert verified["revision_correction"] == {
+        "old": old_revision,
+        "new": payload["dataset"]["revision"],
+        "changed": True,
+        "independently_verified": False,
+    }
+    assert verified["dataset_id"] == "Orellius/cube_out_of_box_v2"
+    assert report["seeds"] == {"val": 42, "eval2": 1042}
+    assert all(verified["labels_equal"].values())
+    payload["dataset"]["extra_metadata"] = "not a revision correction"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="only revision metadata may differ"):
+        trainer.main(
+            [
+                "--eval-run-dir",
+                str(setup.run),
+                "--eval-report",
+                str(setup.report.with_name("bad.json")),
+                "--device",
+                "cpu",
+            ]
+        )
+    assert len(setup.loaded) == 1
+
+
+@pytest.mark.parametrize(
+    "kind", ["empty", "metadata_only", "missing_transformer", "missing_vae", "empty_vae"]
+)
+def test_cosmos3_checkpoint_requires_relevant_nonempty_weights(cosmos3_assets, kind):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    checkpoint = cosmos3_assets.checkpoint
+    if kind == "empty":
+        for path in checkpoint.rglob("*"):
+            if path.is_file():
+                path.unlink()
+    elif kind == "metadata_only":
+        for path in checkpoint.rglob("*.safetensors"):
+            path.unlink()
+    else:
+        component = "transformer" if kind == "missing_transformer" else "vae"
+        path = checkpoint / component / "diffusion_pytorch_model.safetensors"
+        if kind == "empty_vae":
+            path.write_bytes(b"")
+        else:
+            path.unlink()
+    with pytest.raises(FileNotFoundError, match="checkpoint lacks nonempty"):
+        trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)

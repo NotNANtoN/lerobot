@@ -811,9 +811,7 @@ class SmolExpertActionDecoder(nn.Module):
         if action_is_pad is None:
             return squared_error.mean()
         valid = (~action_is_pad).to(dtype=squared_error.dtype).unsqueeze(-1)
-        valid_count = valid.sum() * self.max_action_dim
-        if valid_count.item() <= 0:
-            raise ValueError("action_is_pad leaves no valid action tokens")
+        valid_count = torch.clamp(valid.sum() * self.max_action_dim, min=1.0)
         return (squared_error * valid).sum() / valid_count
 
     def _noise_for_seed(self, batch_size: int, device: torch.device, seed: int) -> Tensor:
