@@ -2131,11 +2131,11 @@ A review of docs vs code found that the online-extraction path added to `train_s
 | Result                                                     | Before                               | Now                                                                                            |
 | :--------------------------------------------------------- | :----------------------------------- | :--------------------------------------------------------------------------------------------- |
 | Phase 6 FLUX.2 online-aug (18.42 / 21.59)                  | completed                            | **INVALID** (B1)                                                                               |
-| Phase 6 Cosmos-2B T=2 online-aug (15.57 / 18.71)           | completed                            | **INVALID** (B2, B3)                                                                           |
-| v1 Cosmos-2B T=2 online unaugmented (14.52)                | not in leaderboard                   | **INVALID** (B2, B3)                                                                           |
+| Phase 6 Cosmos-2B T=2 online-aug (15.57 / 18.71)           | completed                            | `PROVISIONAL` — see §6 (α 16 / σ 10 matched its cache)                                         |
+| v1 Cosmos-2B T=2 online unaugmented (14.52)                | not in leaderboard                   | **INVALID** (B2)                                                                               |
 | 7B / FLUX / 14B video-rollout PSNR tables                  | in `archive/EXPERIMENTS_OVERVIEW.md` | **INVALID** (B4)                                                                               |
 | Cosmos 3 Edge online runs (13.82, 15.48/17.23, sort-cubes) | —                                    | unaffected by B1–B3 (Cosmos 3 already had an identity preflight and reads alpha from metadata) |
-| Scale-100 FLUX.2 cache runs (15.75 / 15.89)                | completed                            | still `PROVISIONAL`; confirm `vae_sha256` in the cache manifests on abakus                     |
+| Scale-100 FLUX.2 cache runs (15.75 / 15.89)                | completed                            | `UNVERIFIED` — cache records no VAE hash (§6)                                                  |
 
 Also recorded: the v2 "quarantine" of 09-08 was never lifted, yet all Scale-100 work used snapshot `5d0325cc`; those numbers are now tagged `PROVISIONAL` until the 140-vs-100 episode discrepancy is explained.
 
@@ -2156,3 +2156,13 @@ Also recorded: the v2 "quarantine" of 09-08 was never lifted, yet all Scale-100 
 ### 5. Next
 
 Re-run `c2b_t2_v1_unaug` with the fixed loader; measure seed variance (3 seeds of `c3_v1_unaug` and SmolVLA); run a SigLIP-features control with the identical SmolExpert recipe; make physical success rate the primary metric. Full list: [status §6](video_vam_status.md#6-next-steps-in-order).
+
+### 6. Integration of uncommitted abakus work (same day)
+
+Before pushing, the uncommitted working tree on abakus (at `f576307f`) was diffed against this cleanup. A full snapshot (patch + untracked files) is kept in `outputs/archive/abakus-wip-20260924/` on the Mac.
+
+- **Already contained** (identical to the Mac WIP): Cartesian/IK trainer changes, `smol_expert.py` action-dim generalization, sort-cubes/SmolVLA wrappers (now presets), `ablate_euler_steps.py`, `test_cartesian_ik.py`, the 09-24 diary entry.
+- **Integrated:** `extract_cosmos3_edge_pure_vision.py --dataset-revision` (required for non-v1 datasets) + its test; the dataset curation toolkit (`lerobot.datasets.curation`, `lerobot-curate` CLI, tests). Hardened on integration: curation UI binds `127.0.0.1` by default (was `0.0.0.0`), matplotlib is an optional import guarded by `_matplotlib_available`.
+- **Superseded:** `run_online_aug_v2_queue.sh` (Phase 6 Cosmos-2B + FLUX queue; replaced by presets) and the 09-14 roadmap note (content below).
+- **09-14 correction recovered from the abakus roadmap:** Cosmos 3 online-aug evaluations were re-run with caches built from the training LoRA (reports in `outputs/evaluation/cosmos3-online-aug-eval-fix-20260914/` on abakus). Corrected original-best scores (Eval-1 / Eval-2): **V1-trained 13.821 / 24.886; V2-trained 15.577 / 17.992**. V2 checkpoint selection remains affected by the old validation mismatch; augmentation benefit is not established. Leaderboard updated accordingly.
+- **Refinement of B2/B3 from abakus run manifests:** `v2-cosmos2b-t2-online-aug-smolexpert` (Phase 6, 15.57 / 18.71) actually used alpha **16** and σ **10**, matching its eval cache (`v2-cosmos2b-t2-undistilled`, α 16, σ 10). So that run is _not_ affected by B2/B3; it stays `PROVISIONAL` (v2 dataset). Only `v1-cosmos2b-t2-online-unaugmented` (α 32 vs cache α 16) is invalidated by B2. The FLUX Scale-100 cache (built 09-07) records no VAE hash, so its provenance cannot confirm a real VAE; together with the online pseudo-latent bug, all FLUX Scale-100 numbers are treated as unverified.

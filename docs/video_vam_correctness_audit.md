@@ -128,6 +128,8 @@ The 09-07 fixes were applied to the offline cache builders, but the online-extra
 
 The step-6000 Cosmos-2B video-LoRA sidecar records rank 16 / alpha 16. The online path injected wrappers from `--backbone-lora-alpha` (default and scripts: 32.0), i.e. a 2× adapter delta, and `load_lora_state_dict` checked only tensor names/shapes. The offline cache builder read alpha from the sidecar (16). **Fix:** `resolve_backbone_lora_hyperparameters` fills rank/alpha from safetensors metadata or sidecar and rejects conflicting CLI values; `inject_and_load_lora_file` builds wrappers from the sidecar; `load_lora_state_dict` fails if any wrapper disagrees with the sidecar.
 
+Confirmed affected: `v1-cosmos2b-t2-online-unaugmented` (α 32 online, cache α 16). The Phase 6 Scale-100 Cosmos-2B online run used α 16 / σ 10 consistently with its cache and is not affected.
+
 ### 6.3 B3 — Online-train vs offline-eval feature identity
 
 Online runs evaluated on precomputed caches. Only Cosmos 3 had an identity preflight. At HEAD `f576307f` online Cosmos-2B used `high_noise_sigma=10` while caches used 80, and the trainer auto-discovered caches from other runs (`outputs/features/v2-cosmos2b-t2-undistilled/...`, `/home/anton/.cache/video-vam/*-scale100-cache/...`). **Fix:** `validate_online_eval_cache_identity` (LoRA sha256/rank/alpha, sigma, `state_t`, hidden layer, augmentation) runs for every non-Cosmos-3 online backbone; cross-run auto-discovery removed (only the sibling `eval2/` of the same cache build is auto-selected in offline mode).

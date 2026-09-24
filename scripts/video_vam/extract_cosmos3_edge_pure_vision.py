@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 DEFAULT_CHECKPOINT_DIR = Path("/home/anton/.cache/video-vam/cosmos3-edge")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episodes", type=int, nargs="+", default=[0])
     parser.add_argument("--stride", type=int, default=3)
@@ -54,7 +54,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/home/anton/.cache/video-vam/cube-out-of-box-dataset"),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--dataset-revision",
+        help="Pinned dataset revision; required for datasets other than the historical V1 dataset.",
+    )
+    args = parser.parse_args(argv)
+    if args.dataset_revision is None:
+        if args.dataset_repo_id != CUBE_OUT_OF_BOX_CONTRACT.repo_id:
+            parser.error("--dataset-revision is required for a non-V1 dataset")
+        args.dataset_revision = CUBE_OUT_OF_BOX_CONTRACT.revision
+    return args
 
 
 def main() -> int:
@@ -82,7 +91,7 @@ def main() -> int:
         args.dataset_repo_id,
         root=str(args.dataset_root),
         delta_timestamps=CUBE_OUT_OF_BOX_CONTRACT.delta_timestamps(),
-        revision=CUBE_OUT_OF_BOX_CONTRACT.revision,
+        revision=args.dataset_revision,
         return_uint8=True,
         download_videos=False,
     )
@@ -111,7 +120,7 @@ def main() -> int:
 
     cache_key = compute_cosmos3_cache_key(
         dataset_repo=args.dataset_repo_id,
-        dataset_revision=CUBE_OUT_OF_BOX_CONTRACT.revision,
+        dataset_revision=args.dataset_revision,
         episodes=args.episodes,
         stride=args.stride,
         clip_frames=5,
@@ -185,7 +194,7 @@ def main() -> int:
         "schema_version": 1,
         "dataset": {
             "repo_id": args.dataset_repo_id,
-            "revision": CUBE_OUT_OF_BOX_CONTRACT.revision,
+            "revision": args.dataset_revision,
         },
         "subset": {
             "episodes": list(args.episodes),

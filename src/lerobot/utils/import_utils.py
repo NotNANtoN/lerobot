@@ -113,6 +113,7 @@ def require_package(pkg_name: str, extra: str, import_name: str | None = None) -
 _transformers_available = is_package_available("transformers")
 _peft_available = is_package_available("peft")
 _scipy_available = is_package_available("scipy")
+_matplotlib_available = is_package_available("matplotlib")
 _diffusers_available = is_package_available("diffusers")
 _torchdiffeq_available = is_package_available("torchdiffeq")
 
