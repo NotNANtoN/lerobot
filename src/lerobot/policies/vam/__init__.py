@@ -1,4 +1,12 @@
-"""Video-action model foundations for LeRobot."""
+"""Video-action model foundations for LeRobot.
+
+Backbone-specific extractors and LoRA helpers (Cosmos 7B/14B, FLUX.2 klein) depend on the
+optional ``diffusers`` package. They are resolved lazily via ``__getattr__`` so that importing
+``lerobot.policies`` does not require ``diffusers``.
+"""
+
+import importlib
+from typing import TYPE_CHECKING, Any
 
 from .base import (
     BaseExtractorConfig,
@@ -45,70 +53,12 @@ from .context_transform import (
     context_transform_metadata,
     context_transform_spec,
 )
-from .cosmos7b_extractor import (
-    Cosmos7BError,
-    Cosmos7BExtractionOutput,
-    Cosmos7BExtractor,
-    Cosmos7BExtractorConfig,
-    build_cosmos7b_dummy_model,
-)
-from .cosmos7b_lora import (
-    Cosmos7BLoRAConfig,
-    Cosmos7BLoRAError,
-    Cosmos7BLoRALinear,
-    compute_cosmos7b_edm_loss,
-    compute_rectified_flow_loss as compute_cosmos7b_rf_loss,
-    inject_cosmos7b_lora,
-    load_cosmos7b_lora,
-    merge_cosmos7b_lora,
-    save_cosmos7b_lora,
-)
-from .cosmos14b_extractor import (
-    Cosmos14BError,
-    Cosmos14BExtractionOutput,
-    Cosmos14BExtractor,
-    Cosmos14BExtractorConfig,
-    build_cosmos14b_dummy_model,
-)
-from .cosmos14b_lora import (
-    Cosmos14BLoRAConfig,
-    Cosmos14BLoRAError,
-    Cosmos14BQuantizedLoRALinear,
-    compute_cosmos14b_edm_loss,
-    compute_rectified_flow_loss as compute_cosmos14b_rf_loss,
-    extract_cosmos14b_lora_state_dict,
-    get_cosmos14b_lora_parameters,
-    inject_cosmos14b_quantized_lora,
-    load_cosmos14b_lora,
-    merge_cosmos14b_quantized_lora,
-    save_cosmos14b_lora,
-)
 from .cosmos_cache_dataset import (
     CacheDatasetItem,
     CacheManifest,
     CosmosFeatureCacheDataset,
     CosmosFeatureCacheManifestError,
     load_cache_manifest,
-)
-from .flux2_klein_extractor import (
-    Flux2KleinError,
-    Flux2KleinExtractionOutput,
-    Flux2KleinExtractor,
-    Flux2KleinExtractorConfig,
-    Flux2KleinTapLocation,
-    MultiReferenceInputs,
-    build_flux2_klein_dummy_model,
-    prepare_multi_reference_conditioning,
-)
-from .flux2_klein_lora import (
-    Flux2KleinLoRAConfig,
-    Flux2KleinLoRAError,
-    Flux2KleinLoRALinear,
-    compute_multi_reference_rf_loss,
-    inject_flux2_klein_lora,
-    load_flux2_klein_lora,
-    merge_flux2_klein_lora,
-    save_flux2_klein_lora,
 )
 from .vam_split import (
     DEFAULT_TRAIN_EPISODES,
@@ -131,6 +81,160 @@ from .world2action import (
     World2ActionDecoder,
     World2ActionDecoderConfig,
 )
+
+# Public name -> (submodule, attribute). These submodules import ``diffusers`` at module level.
+_LAZY_DIFFUSERS_EXPORTS: dict[str, tuple[str, str]] = {
+    **{
+        name: ("cosmos7b_extractor", name)
+        for name in (
+            "Cosmos7BError",
+            "Cosmos7BExtractionOutput",
+            "Cosmos7BExtractor",
+            "Cosmos7BExtractorConfig",
+            "build_cosmos7b_dummy_model",
+        )
+    },
+    **{
+        name: ("cosmos7b_lora", name)
+        for name in (
+            "Cosmos7BLoRAConfig",
+            "Cosmos7BLoRAError",
+            "Cosmos7BLoRALinear",
+            "compute_cosmos7b_edm_loss",
+            "inject_cosmos7b_lora",
+            "load_cosmos7b_lora",
+            "merge_cosmos7b_lora",
+            "save_cosmos7b_lora",
+        )
+    },
+    "compute_cosmos7b_rf_loss": ("cosmos7b_lora", "compute_rectified_flow_loss"),
+    **{
+        name: ("cosmos14b_extractor", name)
+        for name in (
+            "Cosmos14BError",
+            "Cosmos14BExtractionOutput",
+            "Cosmos14BExtractor",
+            "Cosmos14BExtractorConfig",
+            "build_cosmos14b_dummy_model",
+        )
+    },
+    **{
+        name: ("cosmos14b_lora", name)
+        for name in (
+            "Cosmos14BLoRAConfig",
+            "Cosmos14BLoRAError",
+            "Cosmos14BQuantizedLoRALinear",
+            "compute_cosmos14b_edm_loss",
+            "extract_cosmos14b_lora_state_dict",
+            "get_cosmos14b_lora_parameters",
+            "inject_cosmos14b_quantized_lora",
+            "load_cosmos14b_lora",
+            "merge_cosmos14b_quantized_lora",
+            "save_cosmos14b_lora",
+        )
+    },
+    "compute_cosmos14b_rf_loss": ("cosmos14b_lora", "compute_rectified_flow_loss"),
+    **{
+        name: ("flux2_klein_extractor", name)
+        for name in (
+            "Flux2KleinError",
+            "Flux2KleinExtractionOutput",
+            "Flux2KleinExtractor",
+            "Flux2KleinExtractorConfig",
+            "Flux2KleinTapLocation",
+            "MultiReferenceInputs",
+            "build_flux2_klein_dummy_model",
+            "prepare_multi_reference_conditioning",
+        )
+    },
+    **{
+        name: ("flux2_klein_lora", name)
+        for name in (
+            "Flux2KleinLoRAConfig",
+            "Flux2KleinLoRAError",
+            "Flux2KleinLoRALinear",
+            "compute_multi_reference_rf_loss",
+            "inject_flux2_klein_lora",
+            "load_flux2_klein_lora",
+            "merge_flux2_klein_lora",
+            "save_flux2_klein_lora",
+        )
+    },
+}
+
+if TYPE_CHECKING:
+    from .cosmos7b_extractor import (
+        Cosmos7BError,
+        Cosmos7BExtractionOutput,
+        Cosmos7BExtractor,
+        Cosmos7BExtractorConfig,
+        build_cosmos7b_dummy_model,
+    )
+    from .cosmos7b_lora import (
+        Cosmos7BLoRAConfig,
+        Cosmos7BLoRAError,
+        Cosmos7BLoRALinear,
+        compute_cosmos7b_edm_loss,
+        compute_rectified_flow_loss as compute_cosmos7b_rf_loss,
+        inject_cosmos7b_lora,
+        load_cosmos7b_lora,
+        merge_cosmos7b_lora,
+        save_cosmos7b_lora,
+    )
+    from .cosmos14b_extractor import (
+        Cosmos14BError,
+        Cosmos14BExtractionOutput,
+        Cosmos14BExtractor,
+        Cosmos14BExtractorConfig,
+        build_cosmos14b_dummy_model,
+    )
+    from .cosmos14b_lora import (
+        Cosmos14BLoRAConfig,
+        Cosmos14BLoRAError,
+        Cosmos14BQuantizedLoRALinear,
+        compute_cosmos14b_edm_loss,
+        compute_rectified_flow_loss as compute_cosmos14b_rf_loss,
+        extract_cosmos14b_lora_state_dict,
+        get_cosmos14b_lora_parameters,
+        inject_cosmos14b_quantized_lora,
+        load_cosmos14b_lora,
+        merge_cosmos14b_quantized_lora,
+        save_cosmos14b_lora,
+    )
+    from .flux2_klein_extractor import (
+        Flux2KleinError,
+        Flux2KleinExtractionOutput,
+        Flux2KleinExtractor,
+        Flux2KleinExtractorConfig,
+        Flux2KleinTapLocation,
+        MultiReferenceInputs,
+        build_flux2_klein_dummy_model,
+        prepare_multi_reference_conditioning,
+    )
+    from .flux2_klein_lora import (
+        Flux2KleinLoRAConfig,
+        Flux2KleinLoRAError,
+        Flux2KleinLoRALinear,
+        compute_multi_reference_rf_loss,
+        inject_flux2_klein_lora,
+        load_flux2_klein_lora,
+        merge_flux2_klein_lora,
+        save_flux2_klein_lora,
+    )
+
+
+def __getattr__(name: str) -> Any:
+    target = _LAZY_DIFFUSERS_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from lerobot.utils.import_utils import require_package
+
+    require_package("diffusers", extra="diffusers-dep")
+    module = importlib.import_module(f".{target[0]}", __name__)
+    value = getattr(module, target[1])
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "CacheDatasetItem",

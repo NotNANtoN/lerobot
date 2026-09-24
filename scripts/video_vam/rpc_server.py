@@ -168,6 +168,7 @@ class RPCApplication:
             config = VideoVAMConfig.from_pretrained(args.checkpoint)
             config.device = str(self.device)
             config.cosmos_torch_compile = args.compile
+            config.action_euler_steps = getattr(args, "euler_steps", None)
             if args.compile:
                 config.cosmos_compile_friendly = True
             if args.joint_limits_min is not None:
@@ -390,7 +391,15 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="torch.compile the Cosmos DiT with max-autotune (default). Pass --no-compile for eager.",
     )
+    parser.add_argument(
+        "--euler-steps",
+        type=int,
+        default=None,
+        help="Video-VAM action flow Euler steps (default: checkpoint value, 10). E.g. 3 for lower latency.",
+    )
     args = parser.parse_args(argv)
+    if args.euler_steps is not None and args.euler_steps < 1:
+        parser.error("--euler-steps must be >= 1")
     if args.execution_horizon < 1:
         parser.error("--execution-horizon must be >= 1")
     if not math.isfinite(args.max_guidance_weight) or args.max_guidance_weight <= 0:

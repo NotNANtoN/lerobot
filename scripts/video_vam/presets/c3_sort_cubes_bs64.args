@@ -1,0 +1,7 @@
+# Cosmos 3 Edge online on sort-cubes, effective BS 64 (8x8), LR 1e-3 cosine, 10k steps.
+#! include: c3_sort_cubes
+--batch-size 8
+--grad-accum-steps 8
+--lr 1e-3
+--min-steps 3000
+--max-steps 10000

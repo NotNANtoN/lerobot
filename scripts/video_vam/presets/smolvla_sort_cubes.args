@@ -1,0 +1,14 @@
+# SmolVLA sort-cubes baseline: BS 8, AMP, 25k steps, no image transforms.
+#! trainer: lerobot-train
+#! include: _smolvla_sort_cubes
+--dataset.image_transforms.enable=false
+--policy.load_vlm_weights=false
+--policy.vlm_model_name=HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+--policy.use_amp=true
+--policy.n_action_steps=10
+--batch_size=8
+--scheduler.num_decay_steps=25000
+--scheduler.num_warmup_steps=1000
+--steps=25000
+--seed=42
+--num_workers=4

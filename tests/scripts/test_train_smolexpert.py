@@ -861,8 +861,9 @@ def test_cosmos3_cache_matching_effective_adapter_metadata(cosmos3_assets):
     from scripts.video_vam import train_smolexpert as trainer
 
     identity, datasets = trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)
-    assert cosmos3_assets.args.backbone_lora_rank == 16
-    assert cosmos3_assets.args.backbone_lora_alpha == 32.0
+    # CLI rank/alpha are resolved from the adapter metadata, never left at unrelated defaults.
+    assert cosmos3_assets.args.backbone_lora_rank == 2
+    assert cosmos3_assets.args.backbone_lora_alpha == 4.0
     assert identity["lora_rank"] == 2
     assert identity["lora_alpha"] == 4.0
     assert set(datasets) == {"val", "eval2"}
@@ -1669,3 +1670,62 @@ def test_cosmos3_checkpoint_requires_relevant_nonempty_weights(cosmos3_assets, k
             path.unlink()
     with pytest.raises(FileNotFoundError, match="checkpoint lacks nonempty"):
         trainer.preflight_cosmos3_eval_caches(cosmos3_assets.args)
+
+
+def test_online_eval_cache_identity_rejects_mismatched_lora_alpha_and_sigma(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from scripts.video_vam.train_smolexpert import sha256_file, validate_online_eval_cache_identity
+
+    adapter = tmp_path / "best_lora.safetensors"
+    adapter.write_bytes(b"adapter")
+    sha = sha256_file(adapter)
+    manifest = tmp_path / "manifest.json"
+
+    def write(provenance):
+        manifest.write_text(json.dumps({"provenance": provenance, "entries": []}))
+
+    args = SimpleNamespace(
+        backbone_lora_weights=str(adapter),
+        backbone_lora_rank=16,
+        backbone_lora_alpha=16.0,
+        online_backbone="cosmos2b",
+        high_noise_sigma=80.0,
+        backbone_layer=20,
+    )
+    good = {"lora_weights": {"sha256": sha, "rank": 16, "alpha": 16.0}, "high_noise_sigma": 80.0}
+    write(good)
+    validate_online_eval_cache_identity(manifest, args, source="val_manifest")
+
+    write({**good, "lora_weights": {"sha256": sha, "rank": 16, "alpha": 32.0}})
+    with pytest.raises(ValueError, match="alpha"):
+        validate_online_eval_cache_identity(manifest, args, source="val_manifest")
+
+    write({**good, "high_noise_sigma": 10.0})
+    with pytest.raises(ValueError, match="high_noise_sigma"):
+        validate_online_eval_cache_identity(manifest, args, source="val_manifest")
+
+    write({**good, "lora_weights": {"sha256": "0" * 64, "rank": 16, "alpha": 16.0}})
+    with pytest.raises(ValueError, match="sha256"):
+        validate_online_eval_cache_identity(manifest, args, source="val_manifest")
+
+
+def test_backbone_lora_alpha_is_resolved_from_adapter_and_conflicts_rejected(tmp_path: Path):
+    from safetensors.torch import save_file
+
+    from scripts.video_vam.train_smolexpert import parse_args
+
+    adapter = tmp_path / "adapter.safetensors"
+    save_file({"x": torch.zeros(1)}, str(adapter), metadata={"lora_rank": "16", "lora_alpha": "16.0"})
+    base = [
+        "--val-manifest",
+        "v.json",
+        "--backbone-lora-weights",
+        str(adapter),
+        "--output-dir",
+        str(tmp_path / "o"),
+    ]
+    args = parse_args(base)
+    assert (args.backbone_lora_rank, args.backbone_lora_alpha) == (16, 16.0)
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--backbone-lora-alpha", "32.0"])

@@ -263,6 +263,43 @@ def test_lora_roundtrip_across_activation_checkpoint_wrapper(tmp_path):
     assert all(torch.equal(expected[name], actual[name]) for name in expected)
 
 
+def _save_adapter_with_sidecar(tmp_path, *, rank: int, alpha: float):
+    import json
+
+    source = _TinyBackbone()
+    inject_lora(source, rank=rank, alpha=alpha, block_indices=[0, 1])
+    path = tmp_path / "best_lora.safetensors"
+    save_lora_state_dict(source, path)
+    path.with_suffix(".json").write_text(json.dumps({"lora": {"rank": rank, "alpha": alpha}}))
+    return path
+
+
+def test_load_lora_rejects_alpha_that_differs_from_sidecar(tmp_path):
+    import pytest
+
+    path = _save_adapter_with_sidecar(tmp_path, rank=2, alpha=16.0)
+    target = _TinyBackbone()
+    inject_lora(target, rank=2, alpha=32.0, block_indices=[0, 1])
+    with pytest.raises(ValueError, match="sidecar"):
+        load_lora_state_dict(target, path)
+
+
+def test_inject_and_load_lora_file_uses_sidecar_hyperparameters(tmp_path):
+    import pytest
+
+    from lerobot.policies.vam.cosmos_lora import inject_and_load_lora_file
+
+    path = _save_adapter_with_sidecar(tmp_path, rank=2, alpha=16.0)
+    target = _TinyBackbone()
+    info = inject_and_load_lora_file(target, path)
+    assert (info["rank"], info["alpha"], info["block_indices"]) == (2, 16.0, [0, 1])
+    wrapped = [m for m in target.modules() if isinstance(m, LoRALinear)]
+    assert wrapped and all(m.scaling == 8.0 for m in wrapped)
+
+    with pytest.raises(ValueError, match="alpha"):
+        inject_and_load_lora_file(_TinyBackbone(), path, alpha=32.0)
+
+
 def test_cosmos_lora_cosmos3_dual_pathway_dispatch():
     from lerobot.policies.vam.cosmos_lora import (
         DUAL_PATHWAY_TARGET_MODULES,

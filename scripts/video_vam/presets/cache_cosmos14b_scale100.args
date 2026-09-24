@@ -1,0 +1,14 @@
+# Build Cosmos 14B feature caches for Scale-100 (train 0-31,40-89 / val 32-39 / eval2 90-99).
+#! trainer: build_vam_feature_cache.py
+--backbone cosmos14b
+--output-dir /home/anton/.cache/video-vam/${RUN_TAG}
+--dataset-repo-id Orellius/cube_out_of_box_v2
+--train-episodes 0-31,40-89
+--val-episodes 32-39
+--eval2-episodes 90-99
+--train-stride 3
+--val-stride 20
+--eval2-stride 20
+--batch-size 16
+--dtype bfloat16
+--resume

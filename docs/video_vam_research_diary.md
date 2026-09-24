@@ -1,23 +1,14 @@
-# Current correction status — 2026-09-07
+# Video Foundation Models as Robot-Policy Backbones — research diary
 
-The native-path and evaluation repairs are under integration validation; no corrected performance numbers exist yet. See [roadmap](video_vam_roadmap.md), [audit](video_vam_correctness_audit.md), and [metric/sampling revisions](video_vam_action_rmse_protocol.md). Historical claims below must be interpreted with those corrections. In particular, operator/calibration causation is unproven, auxiliary-head low cosine is not proof of lost information, and the 26.12 comparison is not an isolated Video-LoRA effect.
-
-# Video Foundation Models as Robot-Policy Backbones
-
-> **Strategic Living Roadmap**: See [`video_vam_roadmap.md`](video_vam_roadmap.md) for the active project status, complete benchmark scoreboard, and forward execution phases.
-
-## Historical executive summary (2026-09-02; superseded)
-
-See the roadmap and correctness audit for current status. Claims below are preserved as history, not current conclusions.
-
-- **Direct Representation Distillation Milestone**: Direct $T=16 \to T=2$ Layer-20 manifold distillation reached **`13.15°`** validation RMSE at **~204 ms**, beating the undistilled baseline (**13.74°**) and matching the full $T=16$ teacher (**13.06°**) within **0.09°**.
-- **RETRACTED interpretation — theoretical ceiling/98.9%:** Training directly on teacher $T=16$ `cond_frames` reached **`13.08°`**. The distilled model captures **98.9%** of the theoretical ceiling.
-- **Root-Cause Flaws Resolved**: Fixed a 4-frame temporal lag in data loading; identified that auxiliary linear projection heads scramble internal latent features ($\text{CosSim} = 0.28$ without head vs. $0.97$ with direct distillation).
-- **Active Job on `abakus`**: `cosmos3-edge-pipeline-20260902` is running the complete benchmark pipeline for NVIDIA's newly released **`Cosmos3-Edge`** (~4B parameters, Wan 2.2 VAE).
+> **This is a chronological log, not the current state.** Current status, open issues and next steps: [`video_vam_status.md`](video_vam_status.md). All numbers with validity tags: [`video_vam_leaderboard.md`](video_vam_leaderboard.md). Bugs: [`video_vam_correctness_audit.md`](video_vam_correctness_audit.md).
+>
+> Reading notes: entries are in date order (the 08-19 day entry precedes the 08-19 night entry). Claims inside older entries are kept verbatim for provenance even where later entries correct them; corrections are marked inline as **RETRACTED** or in later entries. Known later corrections: operator/calibration causation of the v1 changepoint is unproven; low auxiliary-head cosine is not proof of lost information; 13.08 is an empirical reference, not a ceiling (gap closure 89.4 %, not 98.9 %); the 26.12 comparison is not an isolated video-LoRA effect; 2026-09-24 invalidated several online results (see that entry).
+>
+> Former headers that pointed to `video_vam_roadmap.md` now point to the status doc; the old roadmap is in `archive/`.
 
 ---
 
-## Historical Research diary — 2026-08-17
+## 2026-08-17 — Initial source audit and plan
 
 This is a catch-up document, not an implementation report. No model or dataset code has been written yet. It records the initial source audit, the current machine/repository state, the architecture I believe we are actually dealing with, unresolved scientific risks, a milestone plan, and the first decisions needed before implementation.
 
@@ -1386,6 +1377,88 @@ should not be read as the backbone being useless. It also raises the question of
 whether context extracted at non-zero guidance would be more informative, even
 though upstream uses `guidance=0.0` for extraction.
 
+## 2026-08-19 (day and evening) — the one-hour rule, and what it exposed
+
+### New ground rules
+
+Two process decisions were made today. First: whenever the user messages,
+re-check alignment before continuing — do not barrel ahead on a stale plan.
+Second, a hard experimental constraint: **a training run may take at most one
+hour.** The justification is the method's own premise — mimic-video claims to
+learn _faster_ than a VLA, so if an okay policy is not trainable in an hour,
+the configuration is wrong, not the budget.
+
+A reference document was also written (`VIDEO_VAM_MIMIC_REFERENCE.md`, mirrored
+to `docs/mimic_video_reference.md` in the worktree): the full upstream recipe
+with citations, our per-item compliance, and an explicit deviations table.
+Discipline going forward: change one deviation at a time, and name which rows a
+run touches before launching.
+
+### Findings, in causal order
+
+**The anchor-diversity bug.** All training had been drawing from a precomputed
+stride-20 window manifest — 337 anchors total, ~265 in the train split. Every
+"undertrained" run had actually seen the same 265 scenes ~23 times each while
+95% of training frames were never used. Fixed with uniform random anchor
+sampling (pool: 4,688).
+
+**The clipping strangulation.** Logged gradient norms ran 225–335 against a
+clip of 10 — every update shrunk ~30×, effective learning rate a few percent of
+nominal. An A/B settled on loss_scale 1.0 with clip 10.0 (norms now 2–15). The
+proprio-only floor immediately improved from 32.7° to 26.65°, confirming the
+diagnosis.
+
+**K flow-draws per context.** Our one sanctioned invention: a Cosmos forward
+costs ~4 s while a decoder update is nearly free, so each extracted context now
+supervises K=8 independent (noise, flow-time) draws. Approved by the user.
+
+**Sigma clarified, then deprioritized.** The user's question — "why noise the
+starting image at all?" — exposed a conceptual muddle. The conditioning frames
+are never noised (they stay clean in both upstream and our code); sigma labels
+only the future latent slots, which in our causal setup are pure noise. The only
+self-consistent label for pure noise is the _generation-start_ sigma, which the
+solver says is exactly 80.0. A controlled A/B (sigma 80 vs sigma 10, everything
+else identical) then showed it barely matters: 45.87 vs 46.43. A conceptually
+satisfying answer with no empirical payoff.
+
+**The real constraint is extraction throughput.** Both one-hour VAM runs got
+only ~230 optimizer steps (10.7 s/step, online extraction dominating) and were
+still improving steeply at cutoff — no plateau in sight. SmolVLA, trained fresh
+for one hour under the same rule, did **29,200 steps** and set a new best of
+**14.83°**. Under equal wall-clock the VAM is starved, not refuted. Response:
+precompute the feature cache once (outside the training hour), keep random
+anchor sampling over the cached pool, and let the training hour consist of fast
+steps. Stride-3 cache at sigma 80 (~1,560 anchors, ~122 GB) building overnight,
+followed by a cached-mode one-hour run.
+
+### Scoreboard (held-out 88 windows, degrees, lower is better)
+
+| policy                                      | RMSE          |
+| ------------------------------------------- | ------------- |
+| SmolVLA, 1 hour, 29,200 steps               | **14.83**     |
+| SmolVLA, 5,000 steps                        | 15.00         |
+| state_repeat                                | 18.86         |
+| best-ever VAM (2026-08-18, legacy features) | 26.12         |
+| proprio-only floor (fixed optimization)     | 26.65         |
+| VAM 1h online, sigma 80 / sigma 10          | 45.87 / 46.43 |
+| VAM 1h online, randomized sigma             | 57.35         |
+
+### Warnings for the record
+
+- **The legacy stride-20 cache does not reproduce** under the current (audited,
+  deterministic) extraction pipeline — max element difference 81.5 on a rebuilt
+  window. The 26.12 best-ever was earned on features we can no longer recompute,
+  because none of the VAM code was ever committed and the extractor was mutated
+  in place across two days. A tar snapshot of the working tree now exists
+  (`vam-code-snapshot-20260819-2300.tar.gz`); the deeper fix is version
+  control discipline.
+- Killing a PID whose cmdline begins with `tmux` kills the tmux **server** and
+  every session on the machine. This happened twice (once costing a training
+  run mid-step, once the user's unrelated processes). Kill sessions by name or
+  Python PIDs only.
+
+---
+
 ## 2026-08-19 (night) — the first honest comparison, and a course correction
 
 ### The number that reframed everything
@@ -1564,86 +1637,6 @@ bidirectional, token position does not cleanly separate observed from imagined
 content, which makes the temporal-slicing arms genuinely informative. This
 phase is deliberately structured as a small standalone research piece
 (candidate blog-post/publication artifact).
-
-## 2026-08-19 (day and evening) — the one-hour rule, and what it exposed
-
-### New ground rules
-
-Two process decisions were made today. First: whenever the user messages,
-re-check alignment before continuing — do not barrel ahead on a stale plan.
-Second, a hard experimental constraint: **a training run may take at most one
-hour.** The justification is the method's own premise — mimic-video claims to
-learn _faster_ than a VLA, so if an okay policy is not trainable in an hour,
-the configuration is wrong, not the budget.
-
-A reference document was also written (`VIDEO_VAM_MIMIC_REFERENCE.md`, mirrored
-to `docs/mimic_video_reference.md` in the worktree): the full upstream recipe
-with citations, our per-item compliance, and an explicit deviations table.
-Discipline going forward: change one deviation at a time, and name which rows a
-run touches before launching.
-
-### Findings, in causal order
-
-**The anchor-diversity bug.** All training had been drawing from a precomputed
-stride-20 window manifest — 337 anchors total, ~265 in the train split. Every
-"undertrained" run had actually seen the same 265 scenes ~23 times each while
-95% of training frames were never used. Fixed with uniform random anchor
-sampling (pool: 4,688).
-
-**The clipping strangulation.** Logged gradient norms ran 225–335 against a
-clip of 10 — every update shrunk ~30×, effective learning rate a few percent of
-nominal. An A/B settled on loss_scale 1.0 with clip 10.0 (norms now 2–15). The
-proprio-only floor immediately improved from 32.7° to 26.65°, confirming the
-diagnosis.
-
-**K flow-draws per context.** Our one sanctioned invention: a Cosmos forward
-costs ~4 s while a decoder update is nearly free, so each extracted context now
-supervises K=8 independent (noise, flow-time) draws. Approved by the user.
-
-**Sigma clarified, then deprioritized.** The user's question — "why noise the
-starting image at all?" — exposed a conceptual muddle. The conditioning frames
-are never noised (they stay clean in both upstream and our code); sigma labels
-only the future latent slots, which in our causal setup are pure noise. The only
-self-consistent label for pure noise is the _generation-start_ sigma, which the
-solver says is exactly 80.0. A controlled A/B (sigma 80 vs sigma 10, everything
-else identical) then showed it barely matters: 45.87 vs 46.43. A conceptually
-satisfying answer with no empirical payoff.
-
-**The real constraint is extraction throughput.** Both one-hour VAM runs got
-only ~230 optimizer steps (10.7 s/step, online extraction dominating) and were
-still improving steeply at cutoff — no plateau in sight. SmolVLA, trained fresh
-for one hour under the same rule, did **29,200 steps** and set a new best of
-**14.83°**. Under equal wall-clock the VAM is starved, not refuted. Response:
-precompute the feature cache once (outside the training hour), keep random
-anchor sampling over the cached pool, and let the training hour consist of fast
-steps. Stride-3 cache at sigma 80 (~1,560 anchors, ~122 GB) building overnight,
-followed by a cached-mode one-hour run.
-
-### Scoreboard (held-out 88 windows, degrees, lower is better)
-
-| policy                                      | RMSE          |
-| ------------------------------------------- | ------------- |
-| SmolVLA, 1 hour, 29,200 steps               | **14.83**     |
-| SmolVLA, 5,000 steps                        | 15.00         |
-| state_repeat                                | 18.86         |
-| best-ever VAM (2026-08-18, legacy features) | 26.12         |
-| proprio-only floor (fixed optimization)     | 26.65         |
-| VAM 1h online, sigma 80 / sigma 10          | 45.87 / 46.43 |
-| VAM 1h online, randomized sigma             | 57.35         |
-
-### Warnings for the record
-
-- **The legacy stride-20 cache does not reproduce** under the current (audited,
-  deterministic) extraction pipeline — max element difference 81.5 on a rebuilt
-  window. The 26.12 best-ever was earned on features we can no longer recompute,
-  because none of the VAM code was ever committed and the extractor was mutated
-  in place across two days. A tar snapshot of the working tree now exists
-  (`vam-code-snapshot-20260819-2300.tar.gz`); the deeper fix is version
-  control discipline.
-- Killing a PID whose cmdline begins with `tmux` kills the tmux **server** and
-  every session on the machine. This happened twice (once costing a training
-  run mid-step, once the user's unrelated processes). Kill sessions by name or
-  Python PIDs only.
 
 ---
 
@@ -1854,7 +1847,7 @@ SmolExpert training on the adapted 14B features converged at Step 41,000:
 
 ### 1. Root-Cause Remediation & Extractor Unification (Phase 3)
 
-Following the architectural audit (`docs/ARCHITECTURAL_AUDIT_AND_ABSTRACTIONS.md`), all feature extractors have been migrated to the standardized abstract contract:
+Following the architectural audit (`docs/archive/ARCHITECTURAL_AUDIT_AND_ABSTRACTIONS_de.md`), all feature extractors have been migrated to the standardized abstract contract:
 
 - **BaseVAMExtractor Integration**:
   - `Cosmos7BExtractor` (`src/lerobot/policies/vam/cosmos7b_extractor.py`) inherits from `BaseVAMExtractor`, implements `encode_latents` (connecting real `AutoencoderKLCosmos`), `forward_transformer_blocks`, `compute_grid_shape`, and returns `Cosmos7BExtractionOutput` (subclass of `VAMExtractionOutput`).
@@ -1972,7 +1965,7 @@ The codebase is being updated to enforce:
 
 ### 4. Canonical Plan Established
 
-- Outlined operational sequence in [`docs/video_vam_execution_plan.md`](./video_vam_execution_plan.md) covering:
+- Outlined operational sequence in [`docs/archive/video_vam_execution_plan.md`](./archive/video_vam_execution_plan.md) covering:
   1. T=2 undistilled feature extraction & SmolExpert training.
   2. Teacher unpooled `cond_frames` target extraction & T=2 direct distillation.
   3. Distilled T=2 feature cache extraction & SmolExpert training.
@@ -1984,7 +1977,7 @@ The codebase is being updated to enforce:
 
 ### 1. Physical Hardware Evaluation (SO-101 on `cube_out_of_box`)
 
-- **Policies Tested**: Cosmos 3 Edge Video-LoRA (~80 ms), Cosmos 2B (=2$ distilled / undistilled), and SmolVLA (v1 and v2) via client-server SSH RPC with Real-Time Chunking (RTC) at 10 Hz.
+- **Policies Tested**: Cosmos 3 Edge Video-LoRA (~80 ms), Cosmos 2B ($T=2$ distilled / undistilled), and SmolVLA (v1 and v2) via client-server SSH RPC with Real-Time Chunking (RTC) at 10 Hz.
 - **Hardware Observations**:
   - The client-server RPC loop and 10 Hz RTC execution streamed smoothly without software failure.
   - **Cosmos 3 Edge Video-LoRA** demonstrated the best qualitative trajectory behavior and lowest offline loss, moving closest to the target.
@@ -1996,11 +1989,11 @@ The codebase is being updated to enforce:
 
 - **Hypothesis**: Training SmolExpert on raw, dynamically augmented video frames with stride 1 (9,122 consecutive 5-frame temporal windows) will make the policy invariant to lighting, shadow, and camera angle offsets.
 - **Augmentation Pipeline**:
-  - Applied on GPU per 5-frame window 0$:
+  - Applied on GPU per 5-frame window $[t-4, t]$:
     - Photometric jitter: Random brightness ($\pm 15\%$), contrast ($\pm 15\%$), saturation ($\pm 15\%$), subtle hue ($\pm 5\%$).
     - Spatial crop/translation: Random 4–6% resized crop simulating camera mounting offsets.
     - Sensor noise: Mild Gaussian blur ($\sigma \in [0.1, 0.8]$).
-  - **Critical Invariant**: Augmentations are applied **identically across all =5$ frames** within each temporal window to preserve physical and temporal coherence.
+  - **Critical Invariant**: Augmentations are applied **identically across all $T=5$ frames** within each temporal window to preserve physical and temporal coherence.
   - **Clean Benchmark Safeguard**: Validation and evaluation splits (Eval-1: 32–39, Eval-2: 90–99) remain **strictly unaugmented** for untainted, comparable benchmark tracking.
 
 ### 3. Next Steps & Execution Sequence
@@ -2080,3 +2073,86 @@ To evaluate whether other world model backbones benefit from online dynamic augm
   - **Stage 1 (Active)**: Cosmos 2B ($T=2$ mode) SmolExpert with online data augmentations (`outputs/train/v2-cosmos2b-t2-online-aug-smolexpert`).
   - **Stage 2 (Queued)**: FLUX.2 [klein] SmolExpert with online data augmentations (`outputs/train/v2-flux2-klein-online-aug-smolexpert`).
 - **Hardware Status**: Confirmed executing on NVIDIA GeForce RTX 4090 (PID 400939, ~13.3 GB VRAM, 97% GPU-Util, 360W power draw). Dual evaluation on unaugmented Eval-1 (88 anchors) and Eval-2 (51 anchors) active every 500 steps.
+
+---
+
+## 2026-09-24 — Cartesian Action Space Exploration, Benchmark Audit, and BS=64 Scaling
+
+### 1. Cartesian End-Effector Control & Differential IK
+
+We explored training policies in Cartesian space rather than joint space on `Orellius/so101_sort_cubes_no_top`:
+
+- **Setup & Iteration**:
+  - We initially tested Cartesian actions using $[x, y, z, \text{pitch}, \text{roll}, \text{gripper}]$ with single-step differential IK. This had issues tracking workspace yaw and unrolled with accumulated drift (42.7° joint error, 114 mm position error).
+  - We updated the action space to full 7D Rodrigues rotation vectors $[x, y, z, w_x, w_y, w_z, \text{gripper}]$, added multi-iteration differential IK warm-started across chunks, and enforced physical servo angle bounds ($\pm 110^\circ$).
+  - Ground-truth trajectory roundtrips confirmed machine-precision inversion ($0.00005^\circ$ RMSE).
+- **Empirical Results**:
+  - Training Cosmos 3 Edge on 7D Cartesian actions brought held-out validation error down to **24.58° RMSE** and **55.8 mm position error** (Best Step: 19,500).
+  - However, direct joint-space prediction remains noticeably superior on this 5-DoF arm (**14.81° vs 24.58°**), as predicting independent Cartesian poses can introduce small spatial discrepancies that compound through local IK.
+
+### 2. Historical Benchmark Audit & Generalization Dynamics
+
+We examined the historical `Orellius/so101_sort_cubes_no_top_smolvla_base_100k` checkpoint (reported at 6.515°):
+
+- **Data Split Context**:
+  - The historical run was trained on the entire dataset (`episodes: null`) with an unstratified random 8% holdout rather than an isolated episode split. Because episodes 68..76 were present in its training distribution, it is difficult to determine its true out-of-distribution generalization.
+- **In-Distribution vs. Held-Out Generalization**:
+  - On seen training episodes (0..9), our fresh compiled SmolVLA fits cleanly to **1.84°–2.97° Trajectory RMSE**.
+  - On strictly held-out, unseen episodes (68..76), pure SmolVLA reaches **17.27°** at Step 50,000, after which training loss continues dropping (from 2.97° to 1.84°) while validation error slightly plateaus (17.73° at Step 155k).
+
+### 3. Scaling Cosmos 3 Edge with Large Batches (BS=64)
+
+Scaling the effective batch size of Cosmos 3 Edge Video-LoRA to 64 (batch 8 $\times$ grad accum 8, LR 1e-3 cosine decay) yielded the strongest held-out validation result to date:
+
+- **Held-Out Test Results (Episodes 68..76)**:
+  - **Full 30-Step Trajectory RMSE**: **`14.81°`** (vs 15.45° baseline, and 17.27° for SmolVLA)
+  - **Immediate Next-Step Error ($H=1$)**: **`4.31°`**
+  - **First 5 Steps Average**: **`5.79°`**
+- **Conclusion**: Cosmos 3 Edge demonstrates stronger visual feature transfer on unseen episodes than pure SmolVLA, and large batch training significantly sharpens prefix trajectory accuracy for real-time chunked execution.
+
+- **Caveat added during the 2026-09-24 audit (below):** sort-cubes runs did not pin a dataset revision, all comparisons are single-seed, and the BS=64 (14.81) and 7D-Cartesian (24.58) runs have no local artifact to verify against. "Strongest to date" compares against sort-cubes runs only; these numbers are not comparable to cube-out-of-box.
+
+---
+
+## 2026-09-24 — Second correctness audit: three online-path bugs, invalidated runs, and repo cleanup
+
+A review of docs vs code found that the online-extraction path added to `train_smolexpert.py` on 09-12/13 bypassed the 09-07 fixes. All bugs are fixed in code (uncommitted at time of writing); **no runs have been redone yet**. Details: [correctness audit §6](video_vam_correctness_audit.md#6-second-audit-2026-09-24-post-audit-regressions-in-the-online-path).
+
+### 1. Bugs found
+
+1. **B1 — Pseudo-latents in online FLUX.2.** `OnlineFlux2KleinWrapper` resized frames to 32×32 and zero-padded to 128 channels instead of using the VAE — the exact defect retracted on 09-07. `Flux2KleinExtractor.encode_latents` also silently returned RGB when no VAE path was set.
+2. **B2 — LoRA alpha 2× too large for Cosmos-2B online runs.** The step-6000 adapter was trained with rank 16 / alpha 16 (sidecar), but launch scripts passed `--backbone-lora-alpha 32.0` and the loader never checked the sidecar. The offline eval caches were built with alpha 16, so the policy was trained on one feature space and validated on another.
+3. **B3 — No feature-identity check between online training and offline eval caches** for non-Cosmos-3 backbones. At `f576307f` online Cosmos-2B extracted at σ=10 while the caches used σ=80, and the trainer auto-discovered eval caches produced by other runs.
+4. **B4 — Retracted scripts still runnable** (leaky `train_smolexpert_on_{7b,14b,flux2}`, pseudo-latent extractors/renderers). `render_cosmos14b_rollout.py` used a one-step heuristic latent update instead of a sampler, explaining the identical base/QLoRA PSNR (18.28 dB / 0.7803).
+5. **B5 — Silent Euler-step change** (10 → 3) for all checkpoints in an uncommitted edit; robot tests after 09-17 may have used 3 steps unknowingly.
+
+### 2. Effect on results
+
+| Result                                                     | Before                               | Now                                                                                            |
+| :--------------------------------------------------------- | :----------------------------------- | :--------------------------------------------------------------------------------------------- |
+| Phase 6 FLUX.2 online-aug (18.42 / 21.59)                  | completed                            | **INVALID** (B1)                                                                               |
+| Phase 6 Cosmos-2B T=2 online-aug (15.57 / 18.71)           | completed                            | **INVALID** (B2, B3)                                                                           |
+| v1 Cosmos-2B T=2 online unaugmented (14.52)                | not in leaderboard                   | **INVALID** (B2, B3)                                                                           |
+| 7B / FLUX / 14B video-rollout PSNR tables                  | in `archive/EXPERIMENTS_OVERVIEW.md` | **INVALID** (B4)                                                                               |
+| Cosmos 3 Edge online runs (13.82, 15.48/17.23, sort-cubes) | —                                    | unaffected by B1–B3 (Cosmos 3 already had an identity preflight and reads alpha from metadata) |
+| Scale-100 FLUX.2 cache runs (15.75 / 15.89)                | completed                            | still `PROVISIONAL`; confirm `vae_sha256` in the cache manifests on abakus                     |
+
+Also recorded: the v2 "quarantine" of 09-08 was never lifted, yet all Scale-100 work used snapshot `5d0325cc`; those numbers are now tagged `PROVISIONAL` until the 140-vs-100 episode discrepancy is explained.
+
+### 3. Fixes
+
+- Adapter rank/alpha are read from safetensors metadata or the `.json` sidecar; conflicting CLI values are rejected; `load_lora_state_dict` fails when wrappers disagree with the sidecar.
+- `validate_online_eval_cache_identity` checks LoRA hash/rank/alpha, σ, `state_t`, layer and augmentation for every non-Cosmos-3 online run; cross-run cache auto-discovery removed.
+- Online FLUX.2 requires `--backbone-vae` and uses the native VAE; `encode_latents` fails closed.
+- Euler steps default to the checkpoint value (10); explicit `VideoVAMConfig.action_euler_steps` and `rpc_server.py --euler-steps`.
+- Non-canonical datasets require `--dataset-revision`; train/eval episode overlap is rejected; IK joint limits resolved by joint name; `lerobot.policies` importable without `diffusers`.
+- Regression tests added for B1, B2, B3 and the launcher.
+
+### 4. Cleanup
+
+- Scripts: ~175 → ~65 in `scripts/video_vam/`. One launcher (`run_experiment.sh`) + preset files (`presets/*.args`) + `run_queue.sh` replace ~80 hand-copied `run_*.sh` / queue scripts; retracted, ad-hoc and probe scripts deleted (recoverable from `f576307f`). See [`video_vam_scripts.md`](video_vam_scripts.md).
+- Docs: status lives only in [`video_vam_status.md`](video_vam_status.md), numbers only in [`video_vam_leaderboard.md`](video_vam_leaderboard.md) (with validity tags). Roadmap, technical report, experiments overview, execution plan, German audit copy, old RPC/rollout/robot-plan docs moved to `docs/archive/`; RPC + rollout + robot testing merged into [`video_vam_rollout.md`](video_vam_rollout.md).
+
+### 5. Next
+
+Re-run `c2b_t2_v1_unaug` with the fixed loader; measure seed variance (3 seeds of `c3_v1_unaug` and SmolVLA); run a SigLIP-features control with the identical SmolExpert recipe; make physical success rate the primary metric. Full list: [status §6](video_vam_status.md#6-next-steps-in-order).

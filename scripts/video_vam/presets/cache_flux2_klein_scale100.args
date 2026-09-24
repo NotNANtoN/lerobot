@@ -1,0 +1,3 @@
+# Build FLUX.2 klein junction-tap caches for Scale-100. Requires the native VAE (<checkpoint>/vae or --vae-path).
+#! include: cache_cosmos14b_scale100
+--backbone flux2_klein

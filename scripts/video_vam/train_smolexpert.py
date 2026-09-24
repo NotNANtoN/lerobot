@@ -64,6 +64,9 @@ from lerobot.policies.vam.smol_expert import (
     SmolExpertActionDecoder,
     SmolVLANormalizer,
 )
+from lerobot.utils.rotation import Rotation
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def sha256_file(path: Path) -> str:
@@ -256,6 +259,11 @@ COSMOS3_CHECKPOINT_DIR = Path("/home/anton/.cache/video-vam/cosmos3-edge")
 COSMOS3_CACHE_BUILDER = "scripts/video_vam/extract_cosmos3_edge_pure_vision.py"
 
 
+# Snapshot used by every Scale-100 run so far. NOTE: this snapshot's metadata declares 100 episodes /
+# 12,163 frames while 140 episodes / 15,998 rows are present (see docs/video_vam_status.md).
+SCALE100_V2_REVISION = "5d0325cc1412f4774223a0beb528958108814962"
+
+
 def is_cosmos3(backbone: str | None) -> bool:
     return backbone is not None and backbone.replace("-", "_").lower() in {"cosmos3", "cosmos3_edge"}
 
@@ -333,6 +341,119 @@ def cosmos3_eval_identity(
         "context_tokens": 600,
         "context_dim": 2048,
     }
+
+
+def read_adapter_hyperparameters(path: Path) -> tuple[int, float] | None:
+    """Return the (rank, alpha) an adapter was trained with, from safetensors metadata or sidecar."""
+    from safetensors import safe_open
+
+    from lerobot.policies.vam.cosmos_lora import read_lora_sidecar_hyperparameters
+
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        meta = handle.metadata() or {}
+    for rank_key, alpha_key in (("rank", "alpha"), ("lora_rank", "lora_alpha")):
+        if rank_key in meta and alpha_key in meta:
+            return int(meta[rank_key]), float(meta[alpha_key])
+    return read_lora_sidecar_hyperparameters(path)
+
+
+def resolve_backbone_lora_hyperparameters(args: argparse.Namespace) -> None:
+    """Fill ``--backbone-lora-rank/alpha`` from the adapter and reject contradicting CLI values.
+
+    Passing an alpha different from the one the adapter was trained with silently rescales the
+    LoRA delta (this happened for the Cosmos 2B step-6000 adapter: trained alpha=16, loaded as 32).
+    """
+    if args.backbone_lora_weights is None:
+        args.backbone_lora_rank = args.backbone_lora_rank or 16
+        args.backbone_lora_alpha = args.backbone_lora_alpha or 32.0
+        return
+    path = Path(args.backbone_lora_weights).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"--backbone-lora-weights not found: {path}")
+    try:
+        recorded = read_adapter_hyperparameters(path)
+    except Exception as exc:  # noqa: BLE001 - unreadable header: fall back to explicit values
+        if args.backbone_lora_rank is None or args.backbone_lora_alpha is None:
+            raise ValueError(f"Cannot read rank/alpha from adapter {path}: {exc}") from exc
+        return
+    if recorded is None:
+        if args.backbone_lora_rank is None or args.backbone_lora_alpha is None:
+            raise ValueError(
+                f"Adapter {path} has no rank/alpha metadata or sidecar; pass "
+                "--backbone-lora-rank and --backbone-lora-alpha explicitly."
+            )
+        return
+    rank, alpha = recorded
+    if args.backbone_lora_rank is not None and args.backbone_lora_rank != rank:
+        raise ValueError(f"--backbone-lora-rank {args.backbone_lora_rank} != adapter rank {rank} ({path})")
+    if args.backbone_lora_alpha is not None and not math.isclose(args.backbone_lora_alpha, alpha):
+        raise ValueError(
+            f"--backbone-lora-alpha {args.backbone_lora_alpha} != adapter alpha {alpha} ({path})"
+        )
+    args.backbone_lora_rank, args.backbone_lora_alpha = rank, alpha
+
+
+def _find_lora_record(provenance: dict[str, Any]) -> dict[str, Any] | None:
+    """Locate the LoRA provenance record across the manifest layouts written by our cache builders."""
+    for key in ("lora_weights", "lora"):
+        value = provenance.get(key)
+        if isinstance(value, dict):
+            return value
+    weights = provenance.get("weights")
+    if isinstance(weights, dict) and isinstance(weights.get("lora"), dict):
+        return weights["lora"]
+    return None
+
+
+def validate_online_eval_cache_identity(path: Path, args: argparse.Namespace, *, source: str) -> None:
+    """Fail if an offline eval cache was not produced by the same feature extractor as online training.
+
+    Applies to non-Cosmos3 online backbones (Cosmos3 has its own stricter preflight). Checks the
+    fields that previously differed silently: LoRA file hash, LoRA alpha/rank, Cosmos 2B sigma and
+    tapped layer, and augmentation.
+    """
+    payload = _read_json_object(path)
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError(f"{source} cache has no provenance; cannot verify online feature identity: {path}")
+    problems: list[str] = []
+
+    lora = _find_lora_record(provenance)
+    lora_sha = lora.get("sha256") if lora else provenance.get("lora_sha256")
+    if args.backbone_lora_weights is None:
+        if lora_sha:
+            problems.append("cache was built WITH a LoRA but online training uses none")
+    else:
+        expected_sha = sha256_file(Path(args.backbone_lora_weights).expanduser())
+        if lora_sha != expected_sha:
+            problems.append(f"LoRA sha256 {lora_sha!r} != online adapter {expected_sha!r}")
+        if lora is not None:
+            if "alpha" in lora and not math.isclose(float(lora["alpha"]), float(args.backbone_lora_alpha)):
+                problems.append(f"LoRA alpha {lora['alpha']} != online {args.backbone_lora_alpha}")
+            if "rank" in lora and int(lora["rank"]) != int(args.backbone_lora_rank):
+                problems.append(f"LoRA rank {lora['rank']} != online {args.backbone_lora_rank}")
+
+    b_key = (args.online_backbone or "").replace("-", "_").lower()
+    if "cosmos" in b_key:
+        sigma = provenance.get("high_noise_sigma")
+        if sigma is None or not math.isclose(float(sigma), float(args.high_noise_sigma)):
+            problems.append(f"high_noise_sigma {sigma!r} != online {args.high_noise_sigma}")
+        state_t = provenance.get("state_t")
+        if state_t is not None and int(state_t) != 2:
+            problems.append(f"state_t {state_t} != online 2")
+        layer = provenance.get("hidden_layer")
+        expected_layer = args.backbone_layer if args.backbone_layer is not None else 20
+        if layer is not None and int(layer) != int(expected_layer):
+            problems.append(f"hidden_layer {layer} != online {expected_layer}")
+    for key in ("augment", "augmented"):
+        if provenance.get(key):
+            problems.append(f"evaluation cache is augmented ({key})")
+    if problems:
+        raise ValueError(
+            f"{source} cache {path} does not match the online feature extractor:\n  - "
+            + "\n  - ".join(problems)
+            + "\nRebuild the cache with matching settings or omit it to validate with the online extractor."
+        )
 
 
 def _cosmos3_identity_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -525,6 +646,67 @@ class OnlineVideoItem:
         self.context: Tensor | None = None
 
 
+def joints_to_cartesian(joints: torch.Tensor, kin: Any) -> torch.Tensor:
+    """Convert joint positions [B, T, 6] or [B, 6] to Cartesian end-effector targets [x, y, z, wx, wy, wz, grip]."""
+    orig_ndim = joints.ndim
+    if orig_ndim == 2:
+        joints = joints.unsqueeze(1)
+    b_size, t_size, _ = joints.shape
+    q_np = joints.detach().cpu().numpy()
+    out = np.zeros((b_size, t_size, 7), dtype=np.float32)
+    for b in range(b_size):
+        for t in range(t_size):
+            pose = kin.forward_kinematics(q_np[b, t])
+            xyz = pose[:3, 3]
+            tw = Rotation.from_matrix(pose[:3, :3]).as_rotvec()
+            grip = q_np[b, t, 5]
+            out[b, t] = [xyz[0], xyz[1], xyz[2], tw[0], tw[1], tw[2], grip]
+    res = torch.from_numpy(out).to(device=joints.device, dtype=torch.float32)
+    return res.squeeze(1) if orig_ndim == 2 else res
+
+
+def cartesian_to_joints_ik(
+    q_current: torch.Tensor,
+    cart_chunk: torch.Tensor,
+    kin: Any,
+    num_iters: int = 5,
+    orientation_weight: float = 0.01,
+) -> torch.Tensor:
+    """Convert Cartesian predictions [B, 30, 7] back to joint angles [B, 30, 6] via iterative differential IK."""
+    b_size, t_size, _ = cart_chunk.shape
+    q_curr_np = q_current.detach().cpu().numpy()
+    cart_np = cart_chunk.detach().cpu().numpy()
+    out_joints = np.zeros((b_size, t_size, 6), dtype=np.float32)
+
+    # Enforce physical servo limits (+/- 110 deg) so the QP never jumps to unphysical backward branches.
+    # Resolve q-vector indices by joint name instead of assuming placo's floating-base offset.
+    model = kin.robot.model
+    for joint_name in (name for name in kin.joint_names if name != "gripper"):
+        q_idx = model.joints[model.getJointId(joint_name)].idx_q
+        model.lowerPositionLimit[q_idx] = -np.deg2rad(110.0)
+        model.upperPositionLimit[q_idx] = np.deg2rad(110.0)
+    kin.solver.enable_joint_limits(True)
+
+    for b in range(b_size):
+        q_step = q_curr_np[b].copy()
+        for t in range(t_size):
+            xyz = cart_np[b, t, :3]
+            tw = cart_np[b, t, 3:6]
+            grip = cart_np[b, t, 6]
+
+            target_pose = np.eye(4)
+            target_pose[:3, :3] = Rotation.from_rotvec(tw).as_matrix()
+            target_pose[:3, 3] = xyz
+
+            for _ in range(num_iters):
+                q_step = kin.inverse_kinematics(
+                    q_step, target_pose, position_weight=1.0, orientation_weight=orientation_weight
+                )
+            q_step[5] = grip
+            out_joints[b, t] = q_step
+    return torch.from_numpy(out_joints).to(device=cart_chunk.device, dtype=torch.float32)
+
+
 class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
     """Online video dataset streaming consecutive temporal windows directly from LeRobotDataset."""
 
@@ -543,9 +725,11 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self.stride = stride
         self.contract = contract
         self.manifest_path = Path(f"online://{repo_id}?stride={stride}&episodes={len(episodes)}")
+        revision = getattr(contract, "revision", None) if contract.repo_id == repo_id else None
         self.payload: dict[str, Any] = {
             "source": "online_video_dataset",
             "repo_id": repo_id,
+            "revision": revision,
             "stride": stride,
             "episodes": list(self.episodes),
         }
@@ -555,6 +739,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self.lerobot_ds = LeRobotDataset(
             self.repo_id,
             root=str(self.root) if self.root is not None else None,
+            revision=revision,
             delta_timestamps=self.contract.delta_timestamps(),
             episodes=list(self.episodes),
             return_uint8=True,
@@ -714,6 +899,7 @@ def compute_online_training_normalizer(
     train_dataset: OnlineVideoDataset,
     train_episodes: Sequence[int],
     output_dir: Path,
+    kinematics: Any | None = None,
 ) -> SmolVLANormalizer:
     """Compute SmolVLA normalization statistics from online training dataset."""
     states: list[Tensor] = []
@@ -731,6 +917,10 @@ def compute_online_training_normalizer(
     all_states = torch.stack(states, dim=0)
     all_actions = torch.stack(actions, dim=0)
     all_paddings = torch.stack(paddings, dim=0)
+
+    if kinematics is not None:
+        all_states = joints_to_cartesian(all_states, kinematics)
+        all_actions = joints_to_cartesian(all_actions, kinematics)
 
     normalizer = SmolVLANormalizer.from_training_tensors(
         state=all_states,
@@ -828,6 +1018,7 @@ def evaluate_validation(
     num_steps: int = 10,
     seed: int = 42,
     extractor: Any | None = None,
+    kinematics: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate policy on validation dataset with strict per-sample noise and global masked metrics.
 
@@ -887,6 +1078,7 @@ def evaluate_validation(
         valid_tokens_count = 0
         flow_total = 0.0
         flow_tokens = 0
+        total_cart_pos_err_mm = 0.0
 
         max_action_dim = decoder.max_action_dim
         dtype = (
@@ -959,13 +1151,26 @@ def evaluate_validation(
             epsilon_tensor = torch.cat(sample_epsilons, dim=0)
             t_tensor = torch.tensor(sample_ts, dtype=torch.float32, device=device)
 
+            if kinematics is not None:
+                true_joint_actions = actions
+                true_joint_states = states
+                actions = joints_to_cartesian(actions, kinematics)
+                states = joints_to_cartesian(states, kinematics)
+
             # 2. Action sampling with explicit noise
             pred_actions = decoder.sample_actions(states, contexts, noise=noise, num_steps=num_steps)
 
             # 3. Masked error accumulation
             valid = (~paddings).unsqueeze(-1)  # [B, 30, 1]
             valid_b = valid.squeeze(-1)  # [B, 30]
-            squared_err = (pred_actions.double() - actions.double()).square() * valid  # [B, 30, 6]
+
+            if kinematics is not None:
+                cart_pos_err = torch.norm(pred_actions[..., :3] - actions[..., :3], dim=-1) * 1000.0
+                total_cart_pos_err_mm += float((cart_pos_err * valid_b).sum().item())
+                pred_joint_actions = cartesian_to_joints_ik(true_joint_states, pred_actions, kinematics)
+                squared_err = (pred_joint_actions.double() - true_joint_actions.double()).square() * valid
+            else:
+                squared_err = (pred_actions.double() - actions.double()).square() * valid  # [B, 30, 6]
 
             squared_by_joint += squared_err.sum(dim=(0, 1))
             batch_valid_tokens = int(valid_b.sum().item())
@@ -1038,7 +1243,7 @@ def evaluate_validation(
         else agg_rmse
     )
 
-    return {
+    res = {
         "val_rmse": agg_rmse,
         "val_h1": h1_rmse,
         "val_first5": legacy_first5_mean_rmse,
@@ -1053,6 +1258,9 @@ def evaluate_validation(
         "n_valid_scalars": valid_scalars,
         "val_samples": len(val_dataset),
     }
+    if kinematics is not None:
+        res["cart_pos_mm"] = total_cart_pos_err_mm / max(valid_tokens_count, 1)
+    return res
 
 
 class EarlyStoppingTracker:
@@ -1136,6 +1344,14 @@ def clean_own_artifacts(output_dir: Path) -> None:
             target.unlink()
 
 
+def parse_episodes(ep_str: str) -> tuple[int, ...]:
+    """Parse episode range string like '0:68' or '0,1,2' into a tuple of ints."""
+    if ":" in ep_str:
+        start, end = map(int, ep_str.split(":"))
+        return tuple(range(start, end))
+    return tuple(map(int, ep_str.split(",")))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train unified SmolExpert action decoder across Video Action Model backbones."
@@ -1179,14 +1395,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--backbone-lora-rank",
         type=int,
-        default=16,
-        help="LoRA rank for online backbone (default: 16).",
+        default=None,
+        help="LoRA rank for online backbone. Default: read from the adapter's metadata/sidecar; "
+        "an explicit value must match it.",
     )
     parser.add_argument(
         "--backbone-lora-alpha",
         type=float,
-        default=32.0,
-        help="LoRA alpha for online backbone (default: 32.0).",
+        default=None,
+        help="LoRA alpha for online backbone. Default: read from the adapter's metadata/sidecar; "
+        "an explicit value must match it.",
     )
     parser.add_argument(
         "--backbone-layer",
@@ -1207,10 +1425,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to tokenizer for online backbone (e.g. Cosmos 2B tokenizer.pth).",
     )
     parser.add_argument(
+        "--backbone-vae",
+        type=Path,
+        default=None,
+        help="Native VAE directory for online FLUX.2 klein (required for --online-backbone flux2_klein).",
+    )
+    parser.add_argument(
         "--backbone-prompt-embedding",
         type=Path,
         default=None,
         help="Path to precomputed prompt embedding for online backbone (e.g. Cosmos 2B t5-11b.safetensors).",
+    )
+    parser.add_argument(
+        "--high-noise-sigma",
+        type=float,
+        default=80.0,
+        help="High noise sigma for Cosmos 2B video backbone (default: 80.0).",
     )
     parser.add_argument(
         "--compile-loss",
@@ -1250,10 +1480,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional local path to dataset root.",
     )
     parser.add_argument(
+        "--dataset-revision",
+        type=str,
+        default=None,
+        help="Pinned dataset commit sha. Required for online mode on datasets other than the canonical "
+        "cube_out_of_box v1 (whose revision is fixed by the contract).",
+    )
+    parser.add_argument(
         "--train-stride",
         type=int,
         default=1,
         help="Frame sampling stride for training episodes in online mode (default: 1).",
+    )
+    parser.add_argument(
+        "--train-episodes",
+        type=str,
+        default=None,
+        help="Optional comma-separated or range for train episodes (e.g. '0:68' or '0,1,2').",
+    )
+    parser.add_argument(
+        "--val-episodes",
+        type=str,
+        default=None,
+        help="Optional comma-separated or range for val episodes (e.g. '68:77' or '32:40').",
+    )
+    parser.add_argument(
+        "--use-cartesian-actions",
+        action="store_true",
+        help="Train policy on Cartesian end-effector targets and evaluate via inverse kinematics.",
+    )
+    parser.add_argument(
+        "--urdf-path",
+        type=Path,
+        default=Path("assets/so101_kinematics.urdf"),
+        help="Path to robot URDF for kinematics.",
     )
     parser.add_argument(
         "--normalizer-path",
@@ -1466,6 +1726,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.eval_only:
             parser.error("--eval-only requires --output-dir")
         args.output_dir = default_run_dir(Path(__file__).resolve().parents[2], "smolexpert")
+    try:
+        resolve_backbone_lora_hyperparameters(args)
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
 
     return args
 
@@ -1499,6 +1763,16 @@ def build_run_manifest(
                 "context_shape": list(dataset[0].context.shape),
             }
     norm_path = args.output_dir / "normalizer.safetensors"
+    norm_meta = (
+        json.loads((args.output_dir / "normalizer.json").read_text())
+        if (args.output_dir / "normalizer.json").exists()
+        else {}
+    )
+    action_dim = (
+        len(norm_meta["action_mean"])
+        if "action_mean" in norm_meta and isinstance(norm_meta["action_mean"], list)
+        else ACTION_DIM
+    )
     return {
         "schema_version": 1,
         "status": "running",
@@ -1509,7 +1783,7 @@ def build_run_manifest(
             "type": "synthetic_tiny_smolexpert" if args.dry_run else "SmolExpertActionDecoder",
             "pretrained_source": args.checkpoint_path,
             "pretrained_revision": None,
-            "action_dim": ACTION_DIM,
+            "action_dim": action_dim,
             "action_horizon": ACTION_HORIZON,
             "num_steps": args.num_steps,
             "backbone": args.backbone,
@@ -1520,7 +1794,7 @@ def build_run_manifest(
         "normalizer": {
             "path": norm_path.name,
             "sha256": sha256_file(norm_path),
-            "metadata": json.loads((args.output_dir / "normalizer.json").read_text()),
+            "metadata": norm_meta,
         },
         "selection": {"metric": "val_rmse", "split": "val", "direction": "min"},
         "checkpoints": {"best": None, "last": None},
@@ -1902,6 +2176,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Online Mode: {is_online} (Augment: {args.augment})")
     print(f"Output Directory: {args.output_dir}")
 
+    kinematics: Any | None = None
+    if getattr(args, "use_cartesian_actions", False):
+        from lerobot.model.kinematics import RobotKinematics
+
+        urdf_file = args.urdf_path if args.urdf_path.is_absolute() else (REPO_ROOT / args.urdf_path)
+        kinematics = RobotKinematics(str(urdf_file), target_frame_name="gripper_frame_link")
+        kinematics.solver.enable_joint_limits(False)
+        print(f"Enabled Cartesian end-effector actions + IK (URDF: {urdf_file})")
+
     # Output directory safety check
     if not args.eval_only:
         if args.train_manifest is None and not is_online:
@@ -1921,6 +2204,7 @@ def main(argv: list[str] | None = None) -> int:
     # 1. Validation & Split Enforcement Guard
     train_eps: tuple[int, ...] = ()
     val_eps: tuple[int, ...] = ()
+    eval2_eps: tuple[int, ...] = ()
     require_identity = args.require_identity or (not args.dry_run)
 
     if is_online:
@@ -1930,16 +2214,48 @@ def main(argv: list[str] | None = None) -> int:
             eval2_eps = tuple(range(90, 100))
             if args.dataset_repo_id is None:
                 args.dataset_repo_id = "Orellius/cube_out_of_box_v2"
+            if args.dataset_repo_id == "Orellius/cube_out_of_box_v2" and args.dataset_revision is None:
+                args.dataset_revision = SCALE100_V2_REVISION
             if args.dataset_root is None:
                 args.dataset_root = Path(
-                    "/home/anton/.cache/huggingface/lerobot/hub/datasets--Orellius--cube_out_of_box_v2/snapshots/5d0325cc1412f4774223a0beb528958108814962"
+                    f"/home/anton/.cache/huggingface/lerobot/hub/datasets--Orellius--cube_out_of_box_v2/snapshots/{SCALE100_V2_REVISION}"
                 )
         else:
             train_eps = tuple(range(32))
             val_eps = tuple(range(32, 40))
-            eval2_eps = tuple(range(90, 100))
-            if args.dataset_repo_id is None:
-                args.dataset_repo_id = "hubnemo/cube_out_of_box_dataset"
+
+        if args.train_episodes is not None:
+            train_eps = parse_episodes(args.train_episodes)
+        if args.val_episodes is not None:
+            val_eps = parse_episodes(args.val_episodes)
+        overlap = set(train_eps) & (set(val_eps) | set(eval2_eps))
+        if overlap:
+            raise ValueError(f"Train/eval episode overlap is forbidden: {sorted(overlap)}")
+
+        dataset_contract = CUBE_OUT_OF_BOX_CONTRACT
+        if args.dataset_repo_id and args.dataset_repo_id != CUBE_OUT_OF_BOX_CONTRACT.repo_id:
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+            from lerobot.datasets.vam.config import VideoVAMDatasetConfig
+
+            if args.dataset_revision is None:
+                raise ValueError(
+                    f"--dataset-revision (a commit sha) is required for non-canonical dataset "
+                    f"{args.dataset_repo_id}; unpinned 'main' makes results irreproducible."
+                )
+            meta = LeRobotDatasetMetadata(args.dataset_repo_id, revision=args.dataset_revision)
+            task_str = args.backbone_prompt
+            if getattr(meta, "tasks", None) is not None and len(meta.tasks) > 0:
+                task_str = meta.tasks.index[0] if hasattr(meta.tasks, "index") else str(meta.tasks[0])
+            dataset_contract = VideoVAMDatasetConfig(
+                repo_id=args.dataset_repo_id,
+                revision=args.dataset_revision,
+                fps=meta.fps,
+                total_episodes=meta.total_episodes,
+                total_frames=meta.total_frames,
+                task=task_str,
+            )
+        elif args.dataset_repo_id is None:
+            args.dataset_repo_id = "hubnemo/cube_out_of_box_dataset"
             if args.dataset_root is None:
                 args.dataset_root = Path("/home/anton/.cache/video-vam/cube-out-of-box-dataset")
 
@@ -1950,41 +2266,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Train Stride: {args.train_stride}")
         print(f"  Augmentation: {'ENABLED' if args.augment else 'DISABLED'}")
 
-        # Auto-discover validation manifest if not explicitly given
-        b_k = args.online_backbone.replace("-", "_").lower()
-        if args.val_manifest is None and not is_cosmos3(args.online_backbone):
-            if any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
-                c_c2b = Path("outputs/features/v2-cosmos2b-t2-undistilled/val/manifest.json")
-                if c_c2b.is_file():
-                    args.val_manifest = c_c2b
-                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
-            elif any(k in b_k for k in ("flux2", "flux")):
-                c_flux = Path("/home/anton/.cache/video-vam/flux2-klein-scale100-cache/val/manifest.json")
-                if c_flux.is_file():
-                    args.val_manifest = c_flux
-                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
-
-        # Cosmos3 cross-dataset eval2 must be explicit; never select another run's LoRA cache.
-        if args.eval2_manifest is None and not is_cosmos3(args.online_backbone):
-            if args.val_manifest is not None:
-                val_p = Path(args.val_manifest).resolve()
-                cand = val_p.parent.parent / "eval2/manifest.json"
-                if cand.is_file():
-                    args.eval2_manifest = str(cand)
-                    print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
-            if args.eval2_manifest is None:
-                if any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
-                    c2_c2b = Path("outputs/features/v2-cosmos2b-t2-undistilled/eval2/manifest.json")
-                    if c2_c2b.is_file():
-                        args.eval2_manifest = str(c2_c2b)
-                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
-                elif any(k in b_k for k in ("flux2", "flux")):
-                    c2_flux = Path(
-                        "/home/anton/.cache/video-vam/flux2-klein-scale100-cache/eval2/manifest.json"
-                    )
-                    if c2_flux.is_file():
-                        args.eval2_manifest = str(c2_flux)
-                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+        # No cross-run auto-discovery of evaluation caches: a cache built with a different LoRA,
+        # alpha or sigma silently evaluates a different feature space. Without explicit manifests the
+        # online extractor itself is used for validation (see OnlineVideoDataset below).
+        if not is_cosmos3(args.online_backbone):
+            for name in ("val_manifest", "eval2_manifest"):
+                path = getattr(args, name)
+                if path is None:
+                    continue
+                if args.dry_run:
+                    print(f"[dry-run] Skipping online feature-identity check for {name}: {path}")
+                else:
+                    validate_online_eval_cache_identity(Path(path), args, source=name)
 
     elif args.train_manifest is not None:
         with open(args.val_manifest, encoding="utf-8") as f:
@@ -2027,12 +2320,9 @@ def main(argv: list[str] | None = None) -> int:
     if not is_online and args.eval2_manifest is None and args.val_manifest is not None:
         val_p = Path(args.val_manifest).resolve()
         candidate1 = val_p.parent.parent / "eval2/manifest.json"
-        candidate2 = Path(f"/home/anton/.cache/video-vam/{args.backbone}-scale100-cache/eval2/manifest.json")
+        # Only the sibling split of the same cache build is safe to auto-discover.
         if candidate1.is_file():
             args.eval2_manifest = str(candidate1)
-            print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
-        elif candidate2.is_file():
-            args.eval2_manifest = str(candidate2)
             print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
 
     eval2_dataset: Any = None
@@ -2043,6 +2333,12 @@ def main(argv: list[str] | None = None) -> int:
             eval2_dataset = UnifiedFeatureCacheDataset(
                 args.eval2_manifest, context_transform=args.context_transform
             )
+        if not eval2_eps:
+            from lerobot.policies.vam.base.split_guard import extract_episodes_from_manifest
+
+            eval2_eps = tuple(
+                sorted(extract_episodes_from_manifest(_read_json_object(Path(args.eval2_manifest))))
+            )
         print(f"Eval-Set 2 Verification PASSED ({len(eval2_dataset)} samples).")
     elif is_online and effective_protocol == "scale100":
         eval2_dataset = OnlineVideoDataset(
@@ -2050,7 +2346,7 @@ def main(argv: list[str] | None = None) -> int:
             root=args.dataset_root,
             episodes=eval2_eps,
             stride=20,
-            contract=CUBE_OUT_OF_BOX_CONTRACT,
+            contract=dataset_contract,
         )
         print(f"Eval-Set 2 Online Dataset Initialized ({len(eval2_dataset)} samples).")
 
@@ -2068,7 +2364,7 @@ def main(argv: list[str] | None = None) -> int:
             root=args.dataset_root,
             episodes=val_eps,
             stride=20,
-            contract=CUBE_OUT_OF_BOX_CONTRACT,
+            contract=dataset_contract,
         )
 
     train_dataset: Any = None
@@ -2078,7 +2374,7 @@ def main(argv: list[str] | None = None) -> int:
             root=args.dataset_root,
             episodes=train_eps,
             stride=args.train_stride,
-            contract=CUBE_OUT_OF_BOX_CONTRACT,
+            contract=dataset_contract,
         )
         print(
             f"Loaded online video training dataset with {len(train_dataset)} windows (stride {args.train_stride}, augment={args.augment})"
@@ -2122,7 +2418,9 @@ def main(argv: list[str] | None = None) -> int:
             (args.output_dir / "normalizer.json").write_text(json.dumps(meta_payload, indent=2) + "\n")
         else:
             print("Computing SmolVLA normalizer from online train split...")
-            normalizer = compute_online_training_normalizer(train_dataset, train_eps, args.output_dir)
+            normalizer = compute_online_training_normalizer(
+                train_dataset, train_eps, args.output_dir, kinematics=kinematics
+            )
             print(f"Normalizer computed and saved to {args.output_dir / 'normalizer.safetensors'}")
     elif args.eval_only:
         norm_candidates = []
@@ -2240,28 +2538,46 @@ def main(argv: list[str] | None = None) -> int:
                 tokenizer_path=tok_pth,
                 device=str(device),
                 dtype="bfloat16",
-                high_noise_sigma=10.0,
+                high_noise_sigma=args.high_noise_sigma,
                 seed=args.seed,
                 state_t=2,
                 hidden_layer=args.backbone_layer if args.backbone_layer is not None else 20,
                 stop_after_step=0,
                 vae_input_mode="observed_prefix",
+                compile_friendly=True,
+                torch_compile=False,
+                compile_mode="default",
             )
             print(
                 f"Loading online backbone Cosmos 2B (T=2 mode, checkpoint: {ckpt_pt}, lora: {args.backbone_lora_weights})..."
             )
             raw_c2b_ext = CosmosPredict2Extractor(b_cfg)
-            if args.backbone_lora_weights is not None and Path(args.backbone_lora_weights).is_file():
-                from lerobot.policies.vam.cosmos_lora import inject_lora, load_lora_state_dict
+            if args.backbone_lora_weights is not None:
+                from lerobot.policies.vam.cosmos_lora import inject_and_load_lora_file
 
-                inject_lora(
-                    raw_c2b_ext.backbone, rank=args.backbone_lora_rank, alpha=args.backbone_lora_alpha
+                # Rank/alpha come from the adapter sidecar; explicit CLI values must agree with it.
+                lora_info = inject_and_load_lora_file(
+                    raw_c2b_ext.backbone,
+                    args.backbone_lora_weights,
+                    rank=args.backbone_lora_rank,
+                    alpha=args.backbone_lora_alpha,
                 )
-                load_lora_state_dict(
-                    raw_c2b_ext.backbone, Path(args.backbone_lora_weights).expanduser().resolve()
+                args.backbone_lora_rank = lora_info["rank"]
+                args.backbone_lora_alpha = lora_info["alpha"]
+                print(
+                    f"Loaded Cosmos 2B LoRA {lora_info['path']} "
+                    f"(rank={lora_info['rank']}, alpha={lora_info['alpha']})"
                 )
-                raw_c2b_ext.backbone.eval()
-                print(f"Loaded Cosmos 2B LoRA weights from {args.backbone_lora_weights}")
+            if device.type == "cuda":
+                raw_c2b_ext.backbone = torch.compile(raw_c2b_ext.backbone, mode="default")
+                if hasattr(raw_c2b_ext.tokenizer, "model") and hasattr(raw_c2b_ext.tokenizer.model, "model"):
+                    inner_vae = raw_c2b_ext.tokenizer.model.model
+                    if hasattr(inner_vae, "encoder") and not isinstance(
+                        inner_vae.encoder, torch._dynamo.eval_frame.OptimizedModule
+                    ):
+                        inner_vae.encoder = torch.compile(inner_vae.encoder, mode="default")
+                        print("Compiled Cosmos 2B VAE encoder with torch.compile (mode='default')")
+            raw_c2b_ext.backbone.eval()
 
             class OnlineCosmos2BWrapper:
                 def __init__(self, extractor: Any, prompt: Tensor) -> None:
@@ -2285,16 +2601,21 @@ def main(argv: list[str] | None = None) -> int:
         elif any(k in b_key for k in ("flux2", "flux")):
             from types import SimpleNamespace
 
-            from torch.nn import functional as nn_f
-
+            from lerobot.policies.vam.base.native_video import load_and_validate_prompt_embedding
             from lerobot.policies.vam.flux2_klein_extractor import (
                 Flux2KleinExtractor,
                 Flux2KleinExtractorConfig,
                 prepare_multi_reference_conditioning,
             )
 
+            if args.backbone_vae is None or not Path(args.backbone_vae).exists():
+                raise ValueError(
+                    "Online FLUX.2 klein requires --backbone-vae (the native VAE). The previous "
+                    "bilinear 32x32 pseudo-latent path was removed as invalid (see correctness audit)."
+                )
             b_cfg = Flux2KleinExtractorConfig(
                 checkpoint_path=args.backbone_checkpoint,
+                vae_path=args.backbone_vae,
                 device=str(device),
                 dtype="bfloat16",
                 num_layers=8,
@@ -2305,7 +2626,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"Loading online backbone FLUX.2 klein (tap_location: junction, lora: {args.backbone_lora_weights})..."
             )
             raw_flux_ext = Flux2KleinExtractor(config=b_cfg)
-            if args.backbone_lora_weights is not None and Path(args.backbone_lora_weights).is_file():
+            flux_text_embedding = None
+            if args.backbone_prompt_embedding is not None:
+                flux_text_embedding, _ = load_and_validate_prompt_embedding(
+                    args.backbone_prompt_embedding,
+                    args.backbone_prompt,
+                    b_cfg.joint_attention_dim,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+            if args.backbone_lora_weights is not None:
                 from lerobot.policies.vam.flux2_klein_lora import (
                     Flux2KleinLoRAConfig,
                     inject_flux2_klein_lora,
@@ -2320,45 +2650,43 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 inject_flux2_klein_lora(raw_flux_ext.transformer, lora_cfg)
                 load_flux2_klein_lora(
-                    raw_flux_ext.transformer, Path(args.backbone_lora_weights).expanduser().resolve()
+                    raw_flux_ext.transformer,
+                    Path(args.backbone_lora_weights).expanduser().resolve(),
+                    expected_rank=args.backbone_lora_rank,
+                    expected_alpha=args.backbone_lora_alpha,
                 )
                 print(f"Loaded FLUX.2 klein LoRA weights from {args.backbone_lora_weights}")
 
             class OnlineFlux2KleinWrapper:
-                def __init__(self, extractor: Any, dev: torch.device) -> None:
+                """Same contract as build_vam_feature_cache.py: native VAE, history = frames t-4..t-2, target = t."""
+
+                def __init__(self, extractor: Any, dev: torch.device, text: Tensor | None) -> None:
                     self.extractor = extractor
                     self.dev = dev
+                    self.text = text
 
                 def extract(self, rgb_frames: Tensor) -> Any:
-                    b = rgb_frames.shape[0]
+                    # rgb_frames: [B, 3, T, H, W] in [0, 1]
+                    lat = self.extractor.encode_latents(rgb_frames.to(device=self.dev, dtype=torch.bfloat16))
                     feats = []
-                    for i in range(b):
-                        rgb_5 = rgb_frames[i].permute(1, 0, 2, 3)
-                        rgb_norm = (rgb_5.float() - 0.5) * 2.0
-                        down = nn_f.interpolate(rgb_norm, size=(32, 32), mode="bilinear", align_corners=False)
-                        p48 = down.view(5, 3, 8, 4, 8, 4).permute(0, 1, 3, 5, 2, 4).reshape(5, 48, 8, 8)
-                        p128 = (
-                            nn_f.pad(p48, (0, 0, 0, 0, 0, 80))
-                            .unsqueeze(1)
-                            .to(device=self.dev, dtype=torch.bfloat16)
-                        )
-                        hist = [p128[k] for k in range(3)]
-                        target = p128[3]
+                    for i in range(lat.shape[0]):
+                        target = lat[i : i + 1, :, -1]
+                        hist = [lat[i : i + 1, :, k] for k in range(min(3, lat.shape[2] - 1))]
                         cond = prepare_multi_reference_conditioning(
                             target_latent=target,
                             observation_history=hist,
                             joint_attention_dim=self.extractor.config.joint_attention_dim,
+                            encoder_hidden_states=self.text,
                             device=self.dev,
                             dtype=torch.bfloat16,
                         )
-                        out = self.extractor.extract(cond_inputs=cond)
-                        feats.append(out.features)
+                        feats.append(self.extractor.extract(cond_inputs=cond).features)
                     return SimpleNamespace(features=torch.cat(feats, dim=0))
 
                 def parameters(self):
                     return self.extractor.parameters()
 
-            backbone_extractor = OnlineFlux2KleinWrapper(raw_flux_ext, device)
+            backbone_extractor = OnlineFlux2KleinWrapper(raw_flux_ext, device, flux_text_embedding)
         else:
             raise ValueError(f"Unsupported online backbone: {args.online_backbone}")
 
@@ -2483,6 +2811,7 @@ def main(argv: list[str] | None = None) -> int:
         num_steps=min(args.num_steps, 5 if args.dry_run else args.num_steps),
         seed=args.seed,
         extractor=backbone_extractor,
+        kinematics=kinematics,
     )
     print(
         f"Initial Val -> RMSE: {val_metrics['val_rmse']:.3f}, "
@@ -2547,20 +2876,33 @@ def main(argv: list[str] | None = None) -> int:
                         rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
 
                     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                        # Batched VAE encode across all B samples simultaneously (2.3x faster)
-                        latents_batch = backbone_extractor.encode_latents(rgb_in)
-                        extracted_list = []
-                        for b_i in range(latents_batch.shape[0]):
-                            tapped = backbone_extractor.forward_transformer_blocks(
-                                latents_batch[b_i : b_i + 1]
-                            )
-                            extracted_list.append(tapped[args.backbone_layer])
-                        contexts = torch.cat(extracted_list, dim=0).to(device=device)
+                        if hasattr(backbone_extractor, "encode_latents") and hasattr(
+                            backbone_extractor, "forward_transformer_blocks"
+                        ):
+                            # Batched VAE encode across all B samples simultaneously (2.3x faster)
+                            latents_batch = backbone_extractor.encode_latents(rgb_in)
+                            extracted_list = []
+                            for b_i in range(latents_batch.shape[0]):
+                                tapped = backbone_extractor.forward_transformer_blocks(
+                                    latents_batch[b_i : b_i + 1]
+                                )
+                                extracted_list.append(tapped[args.backbone_layer])
+                            contexts = torch.cat(extracted_list, dim=0).to(device=device)
+                        else:
+                            extracted_list = []
+                            for b_i in range(rgb_in.shape[0]):
+                                out_f = backbone_extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
+                                extracted_list.append(out_f.features)
+                            contexts = torch.cat(extracted_list, dim=0).to(device=device)
             else:
                 contexts = torch.stack([item.context for item in batch_items]).to(device=device)
             action_is_pad = torch.stack([item.action_is_pad for item in batch_items]).to(
                 device=device, dtype=torch.bool
             )
+
+            if kinematics is not None:
+                states = joints_to_cartesian(states, kinematics)
+                actions = joints_to_cartesian(actions, kinematics)
 
             # Flow matching loss with strict padding masking
             loss = flow_matching_loss_fn(
@@ -2603,6 +2945,7 @@ def main(argv: list[str] | None = None) -> int:
                 num_steps=args.num_steps,
                 seed=args.seed,
                 extractor=backbone_extractor,
+                kinematics=kinematics,
             )
             rmse = float(val_metrics["val_rmse"])
             arm_rmse = float(val_metrics["arm_rmse_deg"])
@@ -2648,8 +2991,11 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
             else:
+                cart_info = (
+                    f" | Cart: {val_metrics['cart_pos_mm']:.2f}mm" if "cart_pos_mm" in val_metrics else ""
+                )
                 print(
-                    f"[Eval @ {opt_step}] RMSE: {rmse:.3f} (Arm: {arm_rmse:.3f}°, Grip: {gripper_rmse:.3f}) | "
+                    f"[Eval @ {opt_step}] RMSE: {rmse:.3f} (Arm: {arm_rmse:.3f}°, Grip: {gripper_rmse:.3f}){cart_info} | "
                     f"H1: {h1:.3f} | First-5: {first5:.3f} | Flow Loss: {flow:.4f} "
                     f"(Patience: {early_stopping.bad_evaluations}/{early_stopping.patience}){marker}",
                     flush=True,
@@ -2751,6 +3097,7 @@ def main(argv: list[str] | None = None) -> int:
         num_steps=args.num_steps,
         seed=args.seed,
         extractor=backbone_extractor,
+        kinematics=kinematics,
     )
     final_eval2 = None
     if eval2_dataset is not None:

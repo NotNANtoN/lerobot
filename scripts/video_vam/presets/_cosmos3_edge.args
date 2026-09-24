@@ -1,0 +1,6 @@
+# Cosmos 3 Edge backbone with the V1 video-LoRA (rank/alpha are read from the adapter metadata).
+#! include: _smolexpert_online_base
+--online-backbone cosmos3_edge
+--backbone-checkpoint /home/anton/.cache/video-vam/cosmos3-edge
+--backbone-lora-weights outputs/train/cosmos3-edge-video-lora/best_lora.safetensors
+--backbone-layer 20

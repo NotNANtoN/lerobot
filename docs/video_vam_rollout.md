@@ -1,83 +1,80 @@
-# Mac RPC rollout quickstart
+# Video-VAM robot rollout (Mac ↔ abakus RPC) and physical testing
 
-## Install on the Mac
+Merges the former `video_vam_rpc.md`, `video_vam_rollout.md` (Mac quickstart) and `ROBOT_TESTING_PLAN.md` (now in `archive/`). Code contract for the policy path: [`video_vam_rollout_path.md`](./video_vam_rollout_path.md).
 
-From the Mac `lerobot-video-vam` checkout (not another project's environment):
+## Architecture
+
+- **Mac** owns the SO-101 follower (Feetech serial) and the front camera (OpenCV 640×480 @ 10 fps), runs the 10 Hz control loop and RTC action queue: `scripts/video_vam/run_mac_vam_rpc.py`.
+- **abakus** (RTX 4090) hosts backbone + action expert: `scripts/video_vam/rpc_server.py`, bound to `127.0.0.1:8765` (Mac launcher default port 8766), one request at a time, reached over SSH.
+- The Mac launcher starts/reuses a managed tmux server instance on abakus (`video-vam-rpc-<port>`), identified by resolved checkpoint, file fingerprint, protocol and config. Mismatches replace only the launcher-owned instance; unmanaged listeners are never killed. Startup logs: `/tmp/video-vam-rpc-PORT-INSTANCE.log` on abakus.
+- No exclusive GPU lock for RPC; concurrent inference is permitted (do not run it next to a training job you care about).
+
+## Setup (Mac)
 
 ```sh
 uv sync --locked --extra feetech
-```
-
-Keep the Mac launcher and remote RPC scripts at matching versions. Preserve local edits when syncing.
-The SSH host alias `abakus` must work non-interactively, including its configured SOCKS/proxy connection:
-
-```sh
 ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none abakus true
 ```
 
-A SOCKS/SSH failure during POST is a transport failure, not evidence that inference succeeded.
-Predictions are not automatically retried.
+Keep Mac and abakus checkouts at the same commit (`sync-to-abakus.sh` / `sync-from-abakus.sh`). A SOCKS/SSH failure during POST is a transport failure, not an inference result; predictions are not retried.
 
-## RPC-only test: no camera or motor connection
+## Checkpoint aliases (`--checkpoint`)
 
-Original SmolVLA checkpoint (the launcher's default 029200 checkpoint):
+Defined in `run_mac_vam_rpc.py` (paths on abakus). Status as of 2026-09-24:
+
+| Alias                                               | Run dir                                          | Status                                                              |
+| :-------------------------------------------------- | :----------------------------------------------- | :------------------------------------------------------------------ |
+| `cosmos3_lora` (default)                            | `v2-cosmos3-edge-lora-smolexpert`                | Scale-100 leader (provisional dataset)                              |
+| `cosmos3_aug_v1` / `cosmos3_aug_v2`                 | `v{1,2}-cosmos3-edge-lora-online-aug-smolexpert` | online-aug runs                                                     |
+| `cosmos3_base`                                      | `cosmos3-edge-undseq-smolexpert`                 | pre-routing-fix zero-shot                                           |
+| `cosmos2b_t16`                                      | `cube-out-of-box-cosmos-pool2-smolexpert`        | T=16, ~1.2 s per chunk                                              |
+| `cosmos2b_t2_undistilled` / `cosmos2b_t2_distilled` | `cosmos2b-t2-{undistilled,distilled}-smolexpert` | weights were missing on 09-08; check they were retrained before use |
+| `smolvla_v1` / `smolvla_v2`                         | SmolVLA 29.2k (v1) / 25k (Scale-100)             | baselines                                                           |
+
+Action flow steps: checkpoints default to 10 Euler steps. For lower latency start the server with `--euler-steps 3` (explicit; record it in the test log).
+
+## Dry run (no camera / motors)
+
+```sh
+uv run python scripts/video_vam/run_mac_vam_rpc.py --checkpoint cosmos3_lora --dry-run \
+  --inference.type rtc --ready-timeout 180 --rpc-timeout 120 --stop-server
+```
+
+RTC dry-run sends two requests with synthetic grey images and zero state (no-prefix, then prefix-guided with `inference_delay=1`) and checks finite chunks of the advertised shape. It does **not** validate cameras, calibration, safety, control rate or task success. `--inference.type sync` sends a single request. SmolVLA originals are normalized model actions; Video-VAM originals are physical actions.
+
+## Hardware rollout
+
+Requirements before removing `--dry-run`:
+
+- follower port + robot id with existing calibration; front camera ≥ 10 fps (box camera usually index 1);
+- `--robot.use_degrees=true` and **six measured bounds each** in `--joint-limits-min/--joint-limits-max` (5 joints in degrees, gripper 0–100). The limits in `run_rpc_server.sh` are placeholders, not calibrated limits;
+- complete per-motor `--robot.max_relative_target`; support the arm on disconnect (torque release).
 
 ```sh
 uv run python scripts/video_vam/run_mac_vam_rpc.py \
-  --policy smolvla --dry-run --inference.type rtc --no-compile \
-  --ready-timeout 180 --rpc-timeout 120 --stop-server
+  --checkpoint cosmos3_lora \
+  --robot.type=so101_follower --robot.port=/dev/tty.usbmodem5A460820701 --robot.id=so101 \
+  --robot.use_degrees=true \
+  --joint-limits-min <6 measured values> --joint-limits-max <6 measured values> \
+  --duration=30 --task="take cube out of box"
 ```
 
-Explicit checkpoint **on abakus**, not a Mac filesystem path:
+The loop aborts on invalid actions, stale timing, RTC underruns or clipping. Useful flags: `--keep-server`, `--stop-server`, `--duration`, `--robot.cameras=...` to change camera index. Low-level JSON debugging: `python scripts/video_vam/rpc_client.py --policy video_vam --dry-json` (request: `state`, `images_front_u8_png_b64` — 1 PNG for SmolVLA, 5 for Video-VAM — optional `feature_seed`; response: `action_chunk [30][6]` in physical units, `policy`, `latency_s`).
 
-```sh
-uv run python scripts/video_vam/run_mac_vam_rpc.py \
-  --policy smolvla \
-  --checkpoint /home/anton/lerobot-video-vam/outputs/train/cube_out_of_box_scale100_smolvla_1hr/checkpoints/025000/pretrained_model \
-  --dry-run --inference.type rtc --no-compile \
-  --ready-timeout 180 --rpc-timeout 120 --stop-server
+## Physical test protocol (proposed standard)
+
+Offline RMSE has not predicted grasp success (diary 09-11). Record every session as a row in the leaderboard's future "physical" table:
+
+1. Fixed set of ≥ 10 cube start positions (marked on the table), same lighting notes, camera index, commit, checkpoint alias, `--euler-steps`.
+2. Per trial: success (cube out of box), grasp attempted, grasp success, time to grasp, abort reason.
+3. Order: SmolVLA baseline first, then VAM candidates, interleaved to average drift in lighting/battery.
+
+## Starting the server manually on abakus
+
+```bash
+cd /home/anton/lerobot-video-vam && source scripts/video_vam/cosmos_cuda_env.sh
+.venv/bin/python scripts/video_vam/rpc_server.py --policy video_vam \
+  --checkpoint outputs/train/v2-cosmos3-edge-lora-smolexpert \
+  --joint-limits-min <...> --joint-limits-max <...> [--euler-steps 3] [--no-compile]
+# SmolVLA: --policy smolvla --checkpoint <run>/checkpoints/<step>/pretrained_model (no joint limits)
 ```
-
-RTC dry-run makes two sequential predictions using synthetic grey images and zero state:
-1. An initial no-prefix request.
-2. A prefix-guided request using the first response's original chunk, minus one simulated consumed
-   action, with `inference_delay=1`. It sends the real remaining prefix without zero-padding.
-
-SmolVLA originals are normalized model actions; executed actions are physical units.
-VideoVAM originals/leftovers are physical actions; its decoder normalizes internally.
-Each response is checked for finite chunks of the advertised shape. Timings are printed separately
-and include transport plus inference (the first may include warmup). History is refreshed between calls.
-This does **not** validate cameras, calibration, hardware safety, sustained control rate, or task success.
-
-For a single no-prefix request with no RTC conditioning fields, use `--inference.type sync`.
-Native RTC uses the repository's denoising-guidance approximation: this is **not a paper-equivalence guarantee**.
-
-## Server lifecycle
-
-- Reuse requires matching resolved checkpoint, checkpoint-file fingerprint, protocol, and configuration.
-- Switching policy/checkpoint/config replaces only the launcher-owned tmux instance. Missing identity
-  metadata fails closed. An unmanaged listener is not killed to free the port.
-- Ownership is recorded before starting the model child. Startup failures report the remote log under
-  `/tmp/video-vam-rpc-PORT-INSTANCE.log`.
-- Normally, a server started by this invocation is stopped on exit; a reused server is left alone.
-  `--keep-server` retains a successfully used new instance. `--stop-server` requests cleanup even for
-  a reused instance, but still requires matching managed ownership.
-- No exclusive GPU lock is acquired; concurrent inference processes are permitted.
-
-## Before any hardware rollout
-
-Do not remove `--dry-run` until the real robot setup is verified separately. Hardware mode requires:
-- An SO-100/101 follower serial port and robot ID, existing matching calibration, and an RGB 640x480
-  OpenCV front camera delivering at least 10 FPS.
-- `--robot.use_degrees=true` and **six measured bounds each** in `--joint-limits-min` and
-  `--joint-limits-max`: five arm joints in degrees, then gripper position in [0,100]. Do not invent limits.
-- Positive relative-target limits and a supported arm: disconnect releases torque and may let it fall.
-
-The loop uses 10 Hz observations, one in-flight request, and aborts on invalid actions, stale timing,
-RTC underruns, or clipping. A passing RPC-only test is not authorization to move hardware.
-
-## Current holds
-
-V2 data remains **on hold**; RPC validation does not authorize new collection or promotion.
-The default Cosmos/VideoVAM deployment checkpoint is missing. Do not substitute an unrelated checkpoint
-or claim VideoVAM rollout readiness until compatible artifacts and calibrated limits are available.

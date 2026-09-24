@@ -1,6 +1,6 @@
 # World-model-to-policy approaches: comparison and our measurements
 
-Created 2026-08-24. Companion to `video_vam_cube_out_of_box_leaderboard.md` (numbers) and
+Created 2026-08-24. Companion to `video_vam_leaderboard.md` (numbers) and
 `mimic_video_reference.md` (upstream fidelity). Dataset for all numbers: cube-out-of-box,
 32 train episodes, frozen 88-anchor validation protocol, RMSE in degrees (lower better).
 Baselines: state_repeat 18.86, mean_action 30.15.
@@ -53,7 +53,7 @@ real-time recipe; neither frozen world-model path is yet viable at ~10 Hz.
 
 This section is the implementation checklist for turning the best offline recipe into a
 real-time policy while preserving its representation and task accuracy. Detailed benchmark
-results and primary-source citations live in `video_vam_latency_optimization_plan.md`.
+results and primary-source citations live in `video_vam_latency_cosmos.md`.
 
 ### Semantics-preserving gains to apply
 
@@ -148,7 +148,7 @@ slot is 0.720 GiB; retaining all 35 prefix blocks projects to 26.60 GiB allocate
 23.52 GiB card, so full resident-prefix caching is rejected. One BF16 LTX feature is 18.75
 MiB, roughly four times smaller than unpooled Cosmos context; at the existing ~1,560-anchor
 stride-3 scale this projects to ~28.56 GiB and ~33.9 min compute-only including cold startup.
-See `video_vam_ltx_latency_optimization.md` for commands, stages, and rejected arms.
+See `video_vam_latency_ltx.md` for commands, stages, and rejected arms.
 
 A tiny 2-16-window real-feature overfit is now runtime-reasonable, but only after replacing
 the zero-prompt benchmark tensor with a real Gemma-4 prompt embedding and passing one

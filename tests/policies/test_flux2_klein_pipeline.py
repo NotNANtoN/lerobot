@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
 import torch
 from torch import nn
 
@@ -255,3 +256,31 @@ def test_smolexpert_training_on_flux2_klein_features():
     with torch.no_grad():
         actions = decoder.sample_actions(state=state[:1], context=context[:1], num_steps=2)
         assert actions.shape == (1, ACTION_HORIZON, ACTION_DIM)
+
+
+def test_flux2_klein_encode_latents_fails_closed_without_vae():
+    from lerobot.policies.vam.flux2_klein_extractor import Flux2KleinError
+
+    dummy = build_flux2_klein_dummy_model(
+        num_layers=2,
+        num_single_layers=2,
+        num_attention_heads=2,
+        attention_head_dim=16,
+        in_channels=16,
+        joint_attention_dim=32,
+        axes_dims_rope=(4, 4, 4, 4),
+    )
+    config = Flux2KleinExtractorConfig(
+        num_layers=2,
+        num_single_layers=2,
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_dim=32,
+        in_channels=16,
+        joint_attention_dim=32,
+        axes_dims_rope=(4, 4, 4, 4),
+    )
+    extractor = Flux2KleinExtractor(config=config, model=dummy)
+    # Previously returned the RGB tensor unchanged as "latents" (invalid pseudo-latents).
+    with pytest.raises(Flux2KleinError, match="VAE is not loaded"):
+        extractor.encode_latents(torch.rand(1, 3, 5, 32, 32))

@@ -1,0 +1,5 @@
+# Canonical cube_out_of_box v1 (pinned revision via contract), Protocol 1.0 split 0-31 / 32-39.
+--dataset-repo-id hubnemo/cube_out_of_box_dataset
+--protocol protocol1
+--min-steps 5000
+--max-steps 25000

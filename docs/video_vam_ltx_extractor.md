@@ -1,5 +1,7 @@
 # LTX-2.5 VAM extractor
 
+> **Note (2026-09-24):** the `run_*.sh` wrappers referenced below were removed. Run the underlying Python script after `source scripts/video_vam/cosmos_cuda_env.sh`, or add a preset for `scripts/video_vam/run_experiment.sh` (see [`video_vam_scripts.md`](./video_vam_scripts.md)); old wrappers: `git show f576307f:scripts/video_vam/<name>`.
+
 Status: additive extractor and CPU contract tests are implemented. The real
 checkpoint smoke is intentionally separate because the single RTX 4090 is
 shared and the official weights were not cached when this work began.
@@ -120,7 +122,7 @@ It reports wall-clock, peak allocated/reserved VRAM, shape, dtype, and full
 checkpoint/VAE hashes. The real-weight smoke now passes: 50.488 s for the first
 `extract` call, output `[1, 2400, 4096]`, peak 5.17 GiB allocated / 6.85 GiB
 reserved. No generation or training job is started by the launcher. Detailed
-steady-state measurements are in `video_vam_ltx_latency_optimization.md`.
+steady-state measurements are in `video_vam_latency_ltx.md`.
 
 ## Stage 2: matched extraction point
 
@@ -269,7 +271,7 @@ block 34 measures 1.233393/1.234206 s p50/p90, versus 1.656819/1.659106 s for
 full eager execution, with exact BF16 feature equality. Five VAE frames produce
 one latent while nine produce the required two. Full 35-block GPU residency is
 not feasible: the measured 0.720 GiB slot size projects to 26.60 GiB allocated.
-See `video_vam_ltx_latency_optimization.md` for commands, load/warmup, stage
+See `video_vam_latency_ltx.md` for commands, load/warmup, stage
 timings, cache projections, and remaining limitations.
 
 ## Real-prompt action gate (2026-08-25)

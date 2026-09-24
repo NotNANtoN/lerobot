@@ -1,0 +1,8 @@
+# Cosmos 3 Edge online, cube v1, physics-informed augmentation (Planckian jitter, shadows, gamma).
+#! include: _cosmos3_edge
+#! include: _cube_v1
+--augment
+--aug-strategy physics
+--no-spatial-crop
+--val-manifest outputs/features/cosmos3-edge-lora/val/manifest.json
+--eval2-manifest outputs/features/cosmos3-online-aug-eval-fix-20260914/v1-adapter-eval2/manifest.json

@@ -1,0 +1,6 @@
+# Orellius/so101_sort_cubes_no_top (30 FPS, 77 eps), episode split 0-67 train / 68-76 held out.
+# REQUIRED: pin the dataset commit, e.g. append `--dataset-revision <sha>` (trainer refuses 'main').
+--dataset-repo-id Orellius/so101_sort_cubes_no_top
+--train-episodes 0:68
+--val-episodes 68:77
+--compile-loss

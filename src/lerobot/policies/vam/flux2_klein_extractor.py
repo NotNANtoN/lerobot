@@ -350,7 +350,11 @@ class Flux2KleinExtractor(BaseVAMExtractor):
             )
             return self.normalizer.encode(rgb_frames, deterministic=True)
 
-        return rgb_frames.to(device=self.device, dtype=self.dtype)
+        # Fail closed: silently passing RGB through as "latents" produced invalid features before.
+        raise Flux2KleinError(
+            "FLUX.2 klein VAE is not loaded: set Flux2KleinExtractorConfig.vae_path to an existing "
+            f"VAE directory (got {self.config.vae_path!r}) or assign extractor.vae."
+        )
 
     def forward_transformer_blocks(
         self,

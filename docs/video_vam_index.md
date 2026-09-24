@@ -1,55 +1,50 @@
-# Video-VAM Master Index & Navigation Guide
+# Video-VAM documentation index
 
-**Repository:** `lerobot-video-vam` (Remote: `/home/anton/lerobot-video-vam` on `abakus`)
-**Status:** Consolidated Master Index
+**Repo:** `lerobot-video-vam` (branch `feat-video-vam`; GPU host `abakus`: `/home/anton/lerobot-video-vam`)
+**Question:** do pretrained video-diffusion backbones give better features for SO-101 manipulation policies than 2D VLA encoders?
 
----
+Start with **[status](./video_vam_status.md)**. Every other document has one job; if two documents disagree, the owner in this table wins.
 
-## 1. Documentation Source of Truth Map
+## Owners (single source of truth)
 
-To maintain strict scientific and operational consistency, use the following authoritative sources of truth:
+| Topic                                            | Document                                                                   |
+| :----------------------------------------------- | :------------------------------------------------------------------------- |
+| Current state, open issues, next steps, taxonomy | [`video_vam_status.md`](./video_vam_status.md)                             |
+| **All numbers** (validity-tagged, append-only)   | [`video_vam_leaderboard.md`](./video_vam_leaderboard.md)                   |
+| Metric / split contract (Protocol 1.0, rev 1.1)  | [`video_vam_action_rmse_protocol.md`](./video_vam_action_rmse_protocol.md) |
+| Bug catalogue and invariants                     | [`video_vam_correctness_audit.md`](./video_vam_correctness_audit.md)       |
+| Chronological log (history, not current truth)   | [`video_vam_research_diary.md`](./video_vam_research_diary.md)             |
+| How to run things (presets, launcher, scripts)   | [`video_vam_scripts.md`](./video_vam_scripts.md)                           |
+| Robot / RPC rollout and physical testing         | [`video_vam_rollout.md`](./video_vam_rollout.md)                           |
+| Checkpoint inventory and artifact rules          | [`video_vam_artifacts.md`](./video_vam_artifacts.md)                       |
 
-| Role / Domain                             | Authoritative Document                                                                        | Description                                                                                                                                                       |
-| :---------------------------------------- | :-------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Overnight Execution & Retraining Plan** | [`docs/video_vam_execution_plan.md`](./video_vam_execution_plan.md)                           | Canonical operational sequence for retraining missing T=2 models and verified Protocol 1.0 queue execution.                                                       |
-| **Current Priorities & Strategy**         | [`docs/video_vam_roadmap.md`](./video_vam_roadmap.md)                                         | Current implementation priorities, active research bets, and execution roadmap.                                                                                   |
-| **Bugs, Validity & Correctness Audit**    | [`docs/video_vam_correctness_audit.md`](./video_vam_correctness_audit.md)                     | Exhaustive catalog of identified bugs, data leakage, pseudo-latent mocks, schedule mismatches, and evaluation invariants.                                         |
-| **Metrics & Evaluation Protocol**         | [`docs/video_vam_action_rmse_protocol.md`](./video_vam_action_rmse_protocol.md)               | Frozen Protocol 1.0 specification: mixed-unit aggregate RMSE, horizons (H1 offset 0, first-5 $0..4$, full-30 $0..29$), masking rules, and deterministic sampling. |
-| **Benchmark Results Ledger**              | [`docs/video_vam_cube_out_of_box_leaderboard.md`](./video_vam_cube_out_of_box_leaderboard.md) | Append-only results ledger tracking all validated runs and explicitly annotating retracted historical entries.                                                    |
-| **Technical Synthesis**                   | [`docs/video_vam_technical_report.md`](./video_vam_technical_report.md)                       | Comprehensive architectural taxonomy, layer-targeting formulations, conditioning geometries, and policy benchmarks.                                               |
-| **Historical Journey**                    | [`docs/video_vam_research_diary.md`](./video_vam_research_diary.md)                           | Chronological development log recording daily hypotheses, experiments, and debugging breakthroughs.                                                               |
-| **Architectural Audit**                   | [`docs/ARCHITECTURAL_AUDIT_AND_ABSTRACTIONS.md`](./ARCHITECTURAL_AUDIT_AND_ABSTRACTIONS.md)   | Code audit detailing duplication, base abstractions, and modular refactoring blueprints.                                                                          |
-| **Rollouts & Experiments**                | [`docs/EXPERIMENTS_OVERVIEW.md`](./EXPERIMENTS_OVERVIEW.md)                                   | Video rollout specifications (e.g. 14B 161-frame rollout) and multi-model visual benchmarks.                                                                      |
-| **Artifacts & Model Storage Guide**       | [`docs/video_vam_artifacts.md`](./video_vam_artifacts.md)                                     | Authoritative storage rules, saved checkpoint inventory, and Hugging Face upload standards.                                                                       |
-| **Developer / Agent Guide**               | [`AGENTS.md`](../AGENTS.md)                                                                   | Developer guidelines, CLI conventions, and mandatory coding rules.                                                                                                |
+## Reference material (stable, rarely changes)
 
----
+| Topic                                    | Document                                                                                                                                                 |
+| :--------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Upstream mimic-video recipe & deviations | [`mimic_video_reference.md`](./mimic_video_reference.md)                                                                                                 |
+| Cosmos-Predict2 extractor contract       | [`video_vam_cosmos_extractor.md`](./video_vam_cosmos_extractor.md)                                                                                       |
+| LTX-2.5 extractor                        | [`video_vam_ltx_extractor.md`](./video_vam_ltx_extractor.md)                                                                                             |
+| T5 prompt embedding artifact             | [`video_vam_prompt_embedding.md`](./video_vam_prompt_embedding.md)                                                                                       |
+| World2Action decoder                     | [`video_vam_world2action.md`](./video_vam_world2action.md)                                                                                               |
+| T=2 world expert design                  | [`video_vam_world_expert.md`](./video_vam_world_expert.md)                                                                                               |
+| Policy/rollout code contract             | [`video_vam_rollout_path.md`](./video_vam_rollout_path.md)                                                                                               |
+| Latency: Cosmos path / LTX path          | [`video_vam_latency_cosmos.md`](./video_vam_latency_cosmos.md), [`video_vam_latency_ltx.md`](./video_vam_latency_ltx.md)                                 |
+| Connector literature / ablation          | [`video_vam_connector_survey.md`](./video_vam_connector_survey.md), [`video_vam_connector_ablation_report.md`](./video_vam_connector_ablation_report.md) |
+| World-model usage comparison             | [`video_vam_world_model_usage_comparison.md`](./video_vam_world_model_usage_comparison.md)                                                               |
+| Temporal consistency / RTC               | [`video_vam_temporal_consistency_report.md`](./video_vam_temporal_consistency_report.md)                                                                 |
+| Video prediction preview harness         | [`video_vam_video_prediction_preview.md`](./video_vam_video_prediction_preview.md)                                                                       |
+| RL notes (FLUX-mimic reconstruction)     | [`video_vam_rl_notes.md`](./video_vam_rl_notes.md)                                                                                                       |
+| Training-efficiency figure               | [`blog/training_efficiency/README.md`](./blog/training_efficiency/README.md)                                                                             |
 
-## 2. Canonical Workflows
+Reference docs describe contracts and measurements at the date they state. Numbers in them are **not** authoritative; the leaderboard is.
 
-### A. Feature Extraction & Caching
+## Archive
 
-1. Always use the unified builder `scripts/video_vam/build_vam_feature_cache.py`.
-2. Specify `--dataset-repo-id hubnemo/cube_out_of_box_dataset`, `--train-episodes 0-31`, and `--val-episodes 32-39`.
-3. Ensures genuine causal VAE latent encoding, `action_is_pad` tracking, and Protocol 1.0 episode isolation via `split_guard.py`.
+[`archive/`](./archive/) holds superseded documents (old roadmap, technical report, experiments overview, 09-08 execution plan, German audit copy, LoRA pause note, old RPC/rollout/robot-plan docs, LoRA co-training design). Kept for provenance only; do not update them.
 
-### B. SmolExpert Action Decoder Training
+## Conventions
 
-1. Canonical training entry point: `scripts/video_vam/train_smolexpert.py`.
-2. Pass `--train-manifest` and `--val-manifest`.
-3. Strictly uses train-only normalizer derivation, masks padded actions in flow matching loss, and evaluates global mixed-unit RMSE.
-
-### C. Evaluation & Leaderboard Logging
-
-1. Execute standardized evaluation via `scripts/video_vam/evaluate_action_rmse.py`.
-2. Report Full-30 Mixed RMSE, Horizon-1 (H1 at offset 0), First-5 mean (offsets $0..4$), and per-joint degrees.
-3. Append results to `docs/video_vam_cube_out_of_box_leaderboard.md` following the append-only convention.
-
----
-
-## 3. Operational Conventions on `abakus`
-
-- **Working Directory:** `/home/anton/lerobot-video-vam`.
-- **Environment:** Always prefix execution with `uv run` (or activate `.venv`).
-- **GPU Resource Management:** Source `scripts/video_vam/gpu_lock.sh` and acquire a GPU lock before long-running GPU processes.
-- **Cache Storage:** Primary artifact cache root is `/home/anton/.cache/video-vam/`.
+- Run on `abakus` with `uv run` (or `.venv/bin/python`); long jobs in named tmux sessions; never kill a PID whose cmdline starts with `tmux`.
+- GPU jobs go through `scripts/video_vam/run_experiment.sh` (acquires `gpu_lock.sh`, logs to `outputs/logs/`).
+- New results: append to the leaderboard with dataset + revision, split, seed, and validity tag, then add a diary entry. Never edit historical rows except to add a validity note.

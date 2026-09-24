@@ -1,0 +1,19 @@
+# SmolVLA sort-cubes, 200k steps, torch.compile, BS 32, fp32, transforms.
+#! trainer: lerobot-train
+#! include: _smolvla_sort_cubes
+--dataset.image_transforms.enable=true
+--policy.use_amp=false
+--policy.n_action_steps=50
+--policy.compile_model=true
+--policy.compile_mode=default
+--policy.scheduler_decay_steps=200000
+--policy.scheduler_warmup_steps=10000
+--policy.scheduler_decay_lr=2.5e-6
+--use_policy_training_preset=false
+--batch_size=32
+--scheduler.num_decay_steps=200000
+--scheduler.num_warmup_steps=10000
+--steps=200000
+--save_freq=5000
+--seed=1000
+--num_workers=8

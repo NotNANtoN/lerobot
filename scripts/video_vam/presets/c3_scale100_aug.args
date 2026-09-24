@@ -1,0 +1,15 @@
+# Cosmos 3 Edge online, Scale-100 (v2 snapshot 5d0325cc), legacy augmentation. Phase 6 15.48/17.23 run.
+#! include: _smolexpert_online_base
+--online-backbone cosmos3_edge
+--backbone-checkpoint /home/anton/.cache/video-vam/cosmos3-edge
+--backbone-lora-weights outputs/train/v2-cosmos3-edge-video-lora/best_lora.safetensors
+--backbone-layer 20
+--protocol scale100
+--augment
+--aug-strategy legacy
+--spatial-crop
+--normalizer-path outputs/train/v2-cosmos3-edge-lora-smolexpert/normalizer.safetensors
+--val-manifest outputs/features/v2-cosmos3-edge-lora-15k/val/manifest.json
+--eval2-manifest outputs/features/v2-cosmos3-edge-lora-15k/eval2/manifest.json
+--min-steps 10000
+--max-steps 35000

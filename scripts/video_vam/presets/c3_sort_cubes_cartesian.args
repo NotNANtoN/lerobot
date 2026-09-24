@@ -1,0 +1,4 @@
+# Cosmos 3 Edge online on sort-cubes, 7D Cartesian (xyz + rotvec + gripper) actions, IK for scoring.
+#! include: c3_sort_cubes
+--use-cartesian-actions
+--urdf-path assets/so101_kinematics.urdf

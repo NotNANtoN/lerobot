@@ -1,0 +1,7 @@
+# Cosmos 3 Edge online on sort-cubes, joint-space actions, BS 8 (4x2), 3 Euler steps.
+#! include: _cosmos3_edge
+#! include: _sort_cubes
+--no-augment
+--min-steps 5000
+--max-steps 25000
+--num-steps 3

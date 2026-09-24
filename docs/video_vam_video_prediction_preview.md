@@ -1,5 +1,7 @@
 # Cosmos Video2World prediction preview
 
+> **Note (2026-09-24):** the `run_*.sh` wrappers referenced below were removed. Run the underlying Python script after `source scripts/video_vam/cosmos_cuda_env.sh`, or add a preset for `scripts/video_vam/run_experiment.sh` (see [`video_vam_scripts.md`](./video_vam_scripts.md)); old wrappers: `git show f576307f:scripts/video_vam/<name>`.
+
 This preview is a diagnostic harness for the pinned `hubnemo/cube_out_of_box_dataset`
 scene and the frozen Cosmos-Predict2 2B video2world backbone. It is deliberately
 separate from feature extraction and does not modify the extractor contract.

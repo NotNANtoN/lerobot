@@ -1,5 +1,7 @@
 # Cosmos T=2 World Expert (`cosmos-t2-we`)
 
+> **Note (2026-09-24):** the `run_*.sh` wrappers referenced below were removed. Run the underlying Python script after `source scripts/video_vam/cosmos_cuda_env.sh`, or add a preset for `scripts/video_vam/run_experiment.sh` (see [`video_vam_scripts.md`](./video_vam_scripts.md)); old wrappers: `git show f576307f:scripts/video_vam/<name>`.
+
 2026-08-29. Status: implemented and smoke-tested; full training run not yet
 started. Motivation and design discussion happened after the Cosmos T=2
 LoRA result (13.74° vs 13.06° for T=16 pool2) showed a 0.68° gap despite the

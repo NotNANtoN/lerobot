@@ -124,7 +124,11 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 )
             ),
             device=config.device,
-            num_steps=int(metadata.get("action_semantics", {}).get("euler_steps", 10)),
+            num_steps=(
+                config.action_euler_steps
+                if config.action_euler_steps is not None
+                else int(metadata.get("action_semantics", {}).get("euler_steps", 10))
+            ),
             input_channels=input_channels,
         ).eval()
         should_compile = getattr(config, "cosmos_torch_compile", False)

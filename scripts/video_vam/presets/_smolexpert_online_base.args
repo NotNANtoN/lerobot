@@ -1,0 +1,12 @@
+# Shared SmolExpert online-extraction recipe (stride-1 windows, cosine LR, patience 20, seed 42).
+--train-stride 1
+--batch-size 4
+--grad-accum-steps 2
+--lr 1e-4
+--lr-scheduler cosine
+--warmup-steps 1000
+--val-every 500
+--patience 20
+--seed 42
+--output-dir outputs/train/${RUN_TAG}
+--overwrite

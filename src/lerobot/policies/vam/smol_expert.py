@@ -47,15 +47,15 @@ def cuda_graph_shape_eligible(
     *,
     max_action_dim: int,
     prefix_is_cached: bool,
+    action_dim: int = ACTION_DIM,
 ) -> bool:
-    """Return whether tensor shapes match the serialized production CUDA graph."""
     return (
-        len(state_shape) in (2, 3)
+        prefix_is_cached
+        and len(state_shape) in (2, 3)
         and state_shape[0] == 1
-        and state_shape[-1] == ACTION_DIM
+        and state_shape[-1] == action_dim
         and context_shape == CUDA_GRAPH_CONTEXT_SHAPE
         and noise_shape == (1, ACTION_HORIZON, max_action_dim)
-        and prefix_is_cached
     )
 
 
@@ -73,10 +73,15 @@ class SmolVLANormalizer:
     def __post_init__(self) -> None:
         if self.source_split != "train":
             raise ValueError("SmolVLA normalization statistics must come from source_split='train'")
+        expected_dim = (
+            self.state_mean.shape[0]
+            if isinstance(self.state_mean, Tensor) and self.state_mean.ndim == 1
+            else ACTION_DIM
+        )
         for name in ("state_mean", "state_std", "action_mean", "action_std"):
             value = getattr(self, name)
-            if not isinstance(value, Tensor) or tuple(value.shape) != (ACTION_DIM,):
-                raise ValueError(f"{name} must have shape [6]")
+            if not isinstance(value, Tensor) or value.ndim != 1 or value.shape[0] != expected_dim:
+                raise ValueError(f"{name} must have shape [{expected_dim}]")
             if not torch.is_floating_point(value) or not torch.isfinite(value).all().item():
                 raise ValueError(f"{name} must be finite floating-point data")
         if not math.isfinite(self.eps) or self.eps <= 0:
@@ -94,10 +99,13 @@ class SmolVLANormalizer:
         eps: float = 1e-8,
     ) -> SmolVLANormalizer:
         """Compute population mean/std using train episodes only."""
-        if state.shape[-1] != ACTION_DIM or action.shape[-1] != ACTION_DIM:
-            raise ValueError("state and action tensors must end in six dimensions")
-        state_flat = state.detach().to(dtype=torch.float32).reshape(-1, ACTION_DIM)
-        action_flat = action.detach().to(dtype=torch.float32).reshape(-1, ACTION_DIM)
+        action_dim = state.shape[-1]
+        if action.shape[-1] != action_dim:
+            raise ValueError(
+                f"state (dim {action_dim}) and action (dim {action.shape[-1]}) must have matching dimensions"
+            )
+        state_flat = state.detach().to(dtype=torch.float32).reshape(-1, action_dim)
+        action_flat = action.detach().to(dtype=torch.float32).reshape(-1, action_dim)
         if action_is_pad is None:
             valid_actions = action_flat
         else:
@@ -240,7 +248,7 @@ class _ExpertDenoiseLoop(nn.Module):
             current_time = self.time_values[step].expand(batch_size)
             velocity = self.decoder._vector_field(self.prefix, x_t, current_time)
             x_t = x_t + dt * velocity
-        action = x_t[..., :ACTION_DIM]
+        action = x_t[..., : self.decoder.action_dim]
         return (action * self.action_std.to(dtype=action.dtype) + self.action_mean.to(dtype=action.dtype)).to(
             dtype=torch.float32
         )
@@ -442,6 +450,7 @@ class SmolExpertActionDecoder(nn.Module):
         if kv_dim != num_key_value_heads * head_dim:
             raise ValueError("kv_dim must equal num_key_value_heads * head_dim")
         self.normalizer = normalizer
+        self.action_dim = normalizer.action_mean.shape[0] if normalizer is not None else ACTION_DIM
         self.expert = expert
         self.context_adapter = CosmosPrefixAdapter(input_channels, prefix_hidden_size)
         self.prefix_key_projection = nn.Linear(prefix_hidden_size, kv_dim)
@@ -596,8 +605,10 @@ class SmolExpertActionDecoder(nn.Module):
     def _prepare_prefix(self, state: Tensor, context: Tensor) -> tuple[Tensor, Tensor]:
         if state.ndim == 3:
             state = state[:, -1, :]
-        if state.ndim != 2 or state.shape[-1] != ACTION_DIM:
-            raise ValueError(f"state must have shape [B, 6] or [B, 1, 6], got {tuple(state.shape)}")
+        if state.ndim != 2 or state.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"state must have shape [B, {self.action_dim}] or [B, 1, {self.action_dim}], got {tuple(state.shape)}"
+            )
         context_hidden = self.context_adapter(context)
         state_input = self._pad_action_or_state(self.normalizer.normalize_state(state), self.max_state_dim)
         state_hidden = self.state_proj(state_input.to(dtype=self.state_proj.weight.dtype))[:, None, :]
@@ -773,8 +784,10 @@ class SmolExpertActionDecoder(nn.Module):
         obs_dropout: float = 0.0,
     ) -> Tensor:
         """Compute SmolVLA's mean/std-normalized flow-matching loss."""
-        if action.shape[-2:] != (ACTION_HORIZON, ACTION_DIM):
-            raise ValueError(f"action must have shape [B, 30, 6], got {tuple(action.shape)}")
+        if action.shape[-2:] != (ACTION_HORIZON, self.action_dim):
+            raise ValueError(
+                f"action must have shape [B, {ACTION_HORIZON}, {self.action_dim}], got {tuple(action.shape)}"
+            )
         if action_is_pad is not None and (
             action_is_pad.shape != action.shape[:2] or action_is_pad.dtype is not torch.bool
         ):
@@ -791,10 +804,12 @@ class SmolExpertActionDecoder(nn.Module):
                 dtype=action_normalized.dtype,
                 generator=generator,
             )
-        elif epsilon.shape[-2:] == (ACTION_HORIZON, ACTION_DIM):
+        elif epsilon.shape[-2:] == (ACTION_HORIZON, self.action_dim):
             epsilon = self._pad_action_or_state(epsilon, self.max_action_dim)
         elif epsilon.shape != action_normalized.shape:
-            raise ValueError("epsilon must have shape [B, 30, 6] or [B, 30, 32]")
+            raise ValueError(
+                f"epsilon must have shape [B, {ACTION_HORIZON}, {self.action_dim}] or [B, {ACTION_HORIZON}, {self.max_action_dim}]"
+            )
         if t is None:
             t = sample_time_beta(batch_size, action.device, alpha=1.5, beta=1.0, scale=0.999, offset=0.001)
         if t.shape != (batch_size,):
@@ -841,6 +856,7 @@ class SmolExpertActionDecoder(nn.Module):
                 tuple(noise.shape),
                 max_action_dim=self.max_action_dim,
                 prefix_is_cached=isinstance(prefix, SmolExpertPrefixKVCache),
+                action_dim=self.action_dim,
             )
             or state.device.type != "cuda"
             or context.device != state.device
@@ -930,8 +946,10 @@ class SmolExpertActionDecoder(nn.Module):
             previous = prev_chunk_left_over
             if previous.ndim == 2:
                 previous = previous.unsqueeze(0)
-            if previous.ndim != 3 or previous.shape[0] != batch_size or previous.shape[-1] != ACTION_DIM:
-                raise ValueError("prev_chunk_left_over must have shape [T, 6] or [B, T, 6]")
+            if previous.ndim != 3 or previous.shape[0] != batch_size or previous.shape[-1] != self.action_dim:
+                raise ValueError(
+                    f"prev_chunk_left_over must have shape [T, {self.action_dim}] or [B, T, {self.action_dim}]"
+                )
             previous = self.normalizer.normalize_action(previous.to(device=device, dtype=torch.float32))
             prev_chunk_left_over = self._pad_action_or_state(previous, self.max_action_dim).to(
                 dtype=noise.dtype
@@ -962,4 +980,4 @@ class SmolExpertActionDecoder(nn.Module):
             prev_chunk_left_over=prev_chunk_left_over,
             execution_horizon=execution_horizon,
         )
-        return self.normalizer.denormalize_action(sampled[..., :ACTION_DIM]).to(dtype=torch.float32)
+        return self.normalizer.denormalize_action(sampled[..., : self.action_dim]).to(dtype=torch.float32)

@@ -56,3 +56,34 @@ def test_rpc_launcher_forwards_args_without_exclusive_gpu_lock():
     assert "acquire_gpu_lock" not in text
     assert "source scripts/video_vam/gpu_lock.sh" not in text
     assert "flock" not in text
+
+
+EXPERIMENT_LAUNCHER = Path(__file__).resolve().parents[2] / "scripts" / "video_vam" / "run_experiment.sh"
+
+
+def test_experiment_launcher_lists_and_resolves_presets_with_overrides():
+    listing = subprocess.run(
+        ["bash", str(EXPERIMENT_LAUNCHER), "--list"], check=True, capture_output=True, text=True
+    ).stdout
+    assert "c3_v1_unaug" in listing
+    listed = {line.split()[0] for line in listing.splitlines()[1:] if line.strip()}
+    assert "_cosmos3_edge" not in listed  # shared include fragments are hidden
+
+    result = subprocess.run(
+        ["bash", str(EXPERIMENT_LAUNCHER), "c3_sort_cubes_bs64", "--seed", "7"],
+        env={"DRY_RUN": "1", "PATH": "/usr/bin:/bin", "RUN_TAG": "tagged"},
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "scripts/video_vam/train_smolexpert.py" in result
+    assert "--online-backbone cosmos3_edge" in result  # from included _cosmos3_edge
+    assert "outputs/train/tagged" in result  # ${RUN_TAG} expansion
+    assert result.rstrip().endswith("--seed 7")  # CLI overrides are appended last
+
+
+def test_experiment_launcher_rejects_unknown_preset():
+    result = subprocess.run(
+        ["bash", str(EXPERIMENT_LAUNCHER), "does_not_exist"], capture_output=True, text=True
+    )
+    assert result.returncode == 64

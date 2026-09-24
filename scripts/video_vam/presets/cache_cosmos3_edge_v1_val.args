@@ -1,0 +1,6 @@
+# Extract Cosmos 3 Edge pure-600-token caches (val split 32-39, stride 20 = 88 anchors) with the V1 LoRA.
+#! trainer: extract_cosmos3_edge_pure_vision.py
+--episodes 32 33 34 35 36 37 38 39
+--stride 20
+--lora-checkpoint outputs/train/cosmos3-edge-video-lora/best_lora.safetensors
+--output-dir outputs/features/${RUN_TAG}

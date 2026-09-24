@@ -113,10 +113,13 @@ Tests use temporary directories and CPU synthetic data, not real training jobs.
 | **SmolExpert**    | Cosmos 7B Protocol 1.0               | `outputs/train/cosmos7b-protocol1-smolexpert/`                                 | ✅ Verified (`best`, step 17k)               |
 | **SmolExpert**    | LTX-2.5 Pool2 & Unpooled             | `outputs/train/cube-out-of-box-ltx-{pool2,unpooled}-smolexpert/`               | ✅ Verified (`best`+`last`); on Hugging Face |
 | **Native Policy** | SmolVLA v1 (train-only stats, 29.2k) | `outputs/train/cube_out_of_box_il_smolvla_train_only_stats_0_31_20260826_1hr/` | ✅ Verified; on Hugging Face                 |
-| **Native Policy** | SmolVLA v2 (scale-100, 25k)          | `outputs/train/cube_out_of_box_scale100_smolvla_1hr/`                          | ⚠️ Saved, but dataset quarantined            |
+| **Native Policy** | SmolVLA v2 (scale-100, 25k)          | `outputs/train/cube_out_of_box_scale100_smolvla_1hr/`                          | ⚠️ Saved; v2 dataset integrity unresolved    |
+
+> This inventory is a 2026-09-08 snapshot. Later runs (Scale-100, Phase 6 online, sort-cubes) live under `outputs/train/` on abakus and are listed with their run dirs in the [leaderboard](./video_vam_leaderboard.md). Re-audit before relying on this table.
 
 _Rules:_
 
-1. Always write checkpoints to `outputs/train/<run-name>/` with `best.safetensors`, `last.safetensors`, and `run_manifest.json`.
+1. Always write checkpoints to `outputs/train/<run-name>/` with `best.safetensors`, `last.safetensors`, and `run_manifest.json`. Launch through `scripts/video_vam/run_experiment.sh` so the log records commit and command.
 2. Never store persistent weights in `/tmp/` or volatile cache roots.
-3. Do not run training or evaluation on `Orellius/cube_out_of_box_v2` until the dataset metadata/row discrepancy is resolved.
+3. `Orellius/cube_out_of_box_v2` metadata/row discrepancy is unresolved (declared 100 eps / 12,163 frames, present 140 / 15,998). The 09-08 quarantine was not enforced; Scale-100 runs used snapshot `5d0325cc` and are tagged `PROVISIONAL`.
+4. Video-LoRA adapters must ship with their `.json` sidecar (or safetensors metadata) recording rank and alpha; loaders now refuse to guess.

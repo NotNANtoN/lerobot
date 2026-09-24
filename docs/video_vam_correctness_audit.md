@@ -1,7 +1,7 @@
 # Video-VAM Correctness & Validity Audit
 
 **Status:** Authoritative Source of Truth for Bugs, Validity, and Correctness
-**Date:** September 2026
+**Date:** 2026-09-07, second audit 2026-09-24 (§6)
 **Repository:** `lerobot-video-vam` (`/home/anton/lerobot-video-vam`)
 **Scope:** Deep Architectural Audit across Cosmos 2B/3/7B/14B, FLUX.2 [klein], LTX-2.5, Feature Extractors, Training Loops, and Evaluation Protocols
 
@@ -116,9 +116,37 @@ Concrete extractors must be audited and verified:
 
 ---
 
-## 6. Current Implementation & Operational Status
+## 6. Second audit (2026-09-24): post-audit regressions in the online path
 
-- **Code Status:** Correct extraction pipelines, VAE integrations, and Protocol 1.0 training scripts are being implemented by agents **NOW** and are under active code review.
-- **Execution Status:** **No training or evaluation jobs are currently running or scheduled** on `abakus`. All previous pseudo-latent and random-split runs are retired.
-- **Testing Status:** New unit tests for base abstractions, Cosmos 3 features, and LoRA injection are in place. Tests are pending main verification; pass counts must not be invented or assumed.
-- **Reruns:** Full re-benchmarking across Cosmos 3, Cosmos 7B, Cosmos 14B, and FLUX.2 will be launched only after code review and test verification are complete.
+The 09-07 fixes were applied to the offline cache builders, but the online-extraction path added to `train_smolexpert.py` on 09-12/13 reintroduced or bypassed them. Affected numbers are tagged in the [leaderboard](./video_vam_leaderboard.md).
+
+### 6.1 B1 — Pseudo-latents in online FLUX.2
+
+`OnlineFlux2KleinWrapper` resized RGB to 32×32, space-to-depth packed and zero-padded it to 128 channels instead of calling the VAE (same defect as §3.1). `Flux2KleinExtractor.encode_latents` also returned raw RGB when no VAE path was configured. **Fix:** online FLUX requires `--backbone-vae`, encodes with `FluxVAENormalizer` and mirrors the cache builder's history/target slicing and prompt; `encode_latents` raises `Flux2KleinError` without a VAE.
+
+### 6.2 B2 — LoRA alpha mismatch (Cosmos-2B)
+
+The step-6000 Cosmos-2B video-LoRA sidecar records rank 16 / alpha 16. The online path injected wrappers from `--backbone-lora-alpha` (default and scripts: 32.0), i.e. a 2× adapter delta, and `load_lora_state_dict` checked only tensor names/shapes. The offline cache builder read alpha from the sidecar (16). **Fix:** `resolve_backbone_lora_hyperparameters` fills rank/alpha from safetensors metadata or sidecar and rejects conflicting CLI values; `inject_and_load_lora_file` builds wrappers from the sidecar; `load_lora_state_dict` fails if any wrapper disagrees with the sidecar.
+
+### 6.3 B3 — Online-train vs offline-eval feature identity
+
+Online runs evaluated on precomputed caches. Only Cosmos 3 had an identity preflight. At HEAD `f576307f` online Cosmos-2B used `high_noise_sigma=10` while caches used 80, and the trainer auto-discovered caches from other runs (`outputs/features/v2-cosmos2b-t2-undistilled/...`, `/home/anton/.cache/video-vam/*-scale100-cache/...`). **Fix:** `validate_online_eval_cache_identity` (LoRA sha256/rank/alpha, sigma, `state_t`, hidden layer, augmentation) runs for every non-Cosmos-3 online backbone; cross-run auto-discovery removed (only the sibling `eval2/` of the same cache build is auto-selected in offline mode).
+
+### 6.4 B4 — Retracted scripts still executable
+
+The leaky trainers, pseudo-latent extractors and renderers from §3 remained in `scripts/video_vam/`; `render_cosmos14b_rollout.py` additionally produced "rollouts" with a single heuristic latent update (`latents - w(t) * v`), which explains identical base/QLoRA PSNR. **Fix:** deleted (see [`video_vam_scripts.md`](./video_vam_scripts.md)).
+
+### 6.5 B5 — Silent inference default change
+
+An uncommitted edit changed the Euler-step default from 10 to 3 in `SmolExpertActionDecoder` and `VideoVAMPolicy`. **Fix:** defaults restored to the checkpoint value (10); explicit `VideoVAMConfig.action_euler_steps` / `rpc_server.py --euler-steps`.
+
+### 6.6 Other hardening
+
+- Non-canonical datasets in online mode require `--dataset-revision` (previously loaded unpinned `main`); the Scale-100 snapshot `5d0325cc` is pinned explicitly.
+- Online mode rejects train/eval episode overlap from `--train-episodes/--val-episodes`.
+- Cartesian IK joint limits are set by joint name instead of hard-coded q-indices `[7:12]`.
+- `lerobot.policies` no longer requires `diffusers` at import (lazy exports in `policies/vam/__init__.py`).
+
+## 7. Status
+
+See [`video_vam_status.md`](./video_vam_status.md) §4 for which results must be re-run. Remaining unfixed items: Cosmos 3 und/gen tower history (§2.1, pre-fix results tagged), Cosmos-1.0 EDM vs RF objective (§3.3), v2 dataset integrity.

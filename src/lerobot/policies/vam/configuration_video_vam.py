@@ -73,6 +73,9 @@ class VideoVAMConfig(PreTrainedConfig):
     dataset_revision: str = "243370c3c08bcbd860133c4a0d658ea7c1d2e77e"
     action_feature_names: list[str] = field(default_factory=lambda: list(ACTION_NAMES))
     action_seed: int = 0
+    # Flow-matching Euler steps at inference. None = use the checkpoint's recorded value (training
+    # default 10). Fewer steps (e.g. 3) cut latency; see scripts/video_vam/ablate_euler_steps.py.
+    action_euler_steps: int | None = None
 
     # Backbone noise is derived exactly as in cache construction. The rollout engine
     # supplies an episode-local control-rate frame index. Collection-day config must
@@ -130,6 +133,8 @@ class VideoVAMConfig(PreTrainedConfig):
             raise ValueError("backend must be 'cosmos' or 'ltx'")
         if self.cosmos_state_t not in (2, 16):
             raise ValueError("cosmos_state_t must be 2 (observed-only) or 16")
+        if self.action_euler_steps is not None and self.action_euler_steps < 1:
+            raise ValueError("action_euler_steps must be a positive integer or None")
         if not isinstance(self.cosmos_fp8_linear, bool):
             raise ValueError("cosmos_fp8_linear must be a boolean")
         if not isinstance(self.cosmos_torch_compile, bool):

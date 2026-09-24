@@ -202,7 +202,7 @@ def merge_lora_file_into_base(model: nn.Module, lora_path: str | Path) -> dict[s
     from safetensors import safe_open
 
     with safe_open(str(path), framework="pt", device="cpu") as handle:
-        block_keys = [k for k in handle.keys() if k.startswith("blocks.")]
+        block_keys = [k for k in handle.keys() if k.startswith("blocks.")]  # noqa: SIM118 - safe_open handle
         detected_blocks = sorted({int(k.split(".")[1]) for k in block_keys if k.split(".")[1].isdigit()})
     block_indices = detected_blocks if detected_blocks else None
     adapter_names = inject_lora(model, rank=rank, alpha=float(alpha), block_indices=block_indices)
@@ -307,8 +307,99 @@ def save_lora_state_dict(model: nn.Module, path: str | Path) -> None:
     save_file(lora_state_dict(model), str(path))
 
 
-def load_lora_state_dict(model: nn.Module, path: str | Path) -> None:
-    """Strictly load an adapter-only safetensors checkpoint."""
+def read_lora_sidecar_hyperparameters(path: str | Path) -> tuple[int, float] | None:
+    """Return ``(rank, alpha)`` recorded in the adapter's ``.json`` sidecar, or ``None`` if absent."""
+    sidecar_path = Path(path).expanduser().with_suffix(".json")
+    if not sidecar_path.is_file():
+        return None
+    try:
+        sidecar = json.loads(sidecar_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read LoRA provenance sidecar {sidecar_path}: {exc}") from exc
+    lora = None
+    if isinstance(sidecar, Mapping):
+        lora = sidecar.get("lora") if sidecar.get("lora") is not None else sidecar.get("new_lora")
+    if not isinstance(lora, Mapping):
+        return None
+    rank, alpha = lora.get("rank"), lora.get("alpha")
+    if type(rank) is not int or isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f"LoRA provenance sidecar has invalid rank/alpha: {sidecar_path}")
+    return rank, float(alpha)
+
+
+def _check_wrappers_match_sidecar(model: nn.Module, path: Path) -> None:
+    recorded = read_lora_sidecar_hyperparameters(path)
+    if recorded is None:
+        return
+    rank, alpha = recorded
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALinear) and (
+            module.rank != rank or not math.isclose(module.alpha, alpha, rel_tol=1e-6)
+        ):
+            raise ValueError(
+                f"LoRA wrapper {name} was injected with rank={module.rank}, alpha={module.alpha}, but the "
+                f"adapter sidecar {path.with_suffix('.json')} records rank={rank}, alpha={alpha}. Loading would "
+                f"rescale the adapter by {module.alpha / module.rank:.4g} instead of {alpha / rank:.4g}."
+            )
+
+
+def inject_and_load_lora_file(
+    model: nn.Module,
+    path: str | Path,
+    *,
+    rank: int | None = None,
+    alpha: float | None = None,
+) -> dict[str, Any]:
+    """Inject LoRA wrappers using the adapter's sidecar hyperparameters, then strictly load it.
+
+    ``rank``/``alpha`` are optional caller expectations. If the sidecar exists they must agree with
+    it (fail-closed); if it is absent they are required.
+    """
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"LoRA weights not found: {path}")
+    recorded = read_lora_sidecar_hyperparameters(path)
+    if recorded is not None:
+        side_rank, side_alpha = recorded
+        if rank is not None and rank != side_rank:
+            raise ValueError(f"requested LoRA rank {rank} != sidecar rank {side_rank} for {path}")
+        if alpha is not None and not math.isclose(float(alpha), side_alpha, rel_tol=1e-6):
+            raise ValueError(f"requested LoRA alpha {alpha} != sidecar alpha {side_alpha} for {path}")
+        rank, alpha = side_rank, side_alpha
+    elif rank is None or alpha is None:
+        raise ValueError(f"LoRA sidecar missing for {path}; rank and alpha must be given explicitly")
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        block_ids = sorted(
+            {
+                int(parts[1])
+                for key in handle.keys()  # noqa: SIM118
+                if len(parts := _canonical_lora_name(key).split(".")) > 2
+                and parts[0] == "blocks"
+                and parts[1].isdigit()
+            }
+        )
+    adapter_names = inject_lora(model, rank=rank, alpha=float(alpha), block_indices=block_ids or None)
+    load_lora_state_dict(model, path)
+    return {
+        "path": str(path),
+        "sha256": _sha256_file(path),
+        "rank": rank,
+        "alpha": float(alpha),
+        "block_indices": block_ids,
+        "adapter_modules": len(adapter_names),
+    }
+
+
+def load_lora_state_dict(model: nn.Module, path: str | Path, *, check_sidecar: bool = True) -> None:
+    """Strictly load an adapter-only safetensors checkpoint.
+
+    When a ``.json`` provenance sidecar exists next to the adapter, the injected wrappers' rank and
+    alpha must match it; otherwise the effective LoRA scale silently differs from training.
+    """
+    if check_sidecar:
+        _check_wrappers_match_sidecar(model, Path(path).expanduser())
     raw_actual = load_file(str(Path(path)), device="cpu")
     actual: dict[str, torch.Tensor] = {}
     for name, tensor in raw_actual.items():
