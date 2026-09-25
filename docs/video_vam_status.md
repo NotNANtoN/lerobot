@@ -13,7 +13,7 @@ Context: a SmolVLA policy on sort-cubes worked well on the robot (Nov 2025, `Ore
 
 Upstream: merged huggingface/lerobot `main` @ `e624f3f7` on 2026-09-25 (adds FLUX 3 Action `lerobot.policies.flux3`). Robot data note: our SO-101 setups have a **wrist camera only** (F3A expects scene + wrist).
 
-Plans: [PEFT blog](./plan_peft_blog.md) · [T=2 distillation](./plan_t2_distillation.md) · [research direction, venues, BFL side goal](./plan_research_direction.md).
+Plans: [PEFT blog](./plan_peft_blog.md) · [T=2 distillation](./plan_t2_distillation.md) · [FLUX 3 Action / wrist-only](./plan_flux3_action.md) · [research direction, venues, BFL side goal](./plan_research_direction.md).
 
 ## 1. One-paragraph summary
 

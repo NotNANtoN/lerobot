@@ -66,6 +66,8 @@ Use **sort-cubes** as the demo task: it has a policy that works on the robot and
 
 ## 7. Open questions for Nemo
 
+(Casual German message sent 2026-09-25: asked whether he was involved in the F3A × LeRobot SO-101 PEFT testing and proposed a simpler first post — LoRA on F3A or SmolVLA on SO-101 — instead of the distillation story.)
+
 - Preferred angle (A/B/C/D)? Hugging Face blog vs PEFT docs example vs LeRobot docs?
 - Any PEFT methods they want showcased beyond LoRA (e.g. DoRA, LoRA+ , VeRA, adapter merging)?
 - Timeline / review process; can it include a Space or a Hub collection of adapters?
