@@ -34,3 +34,16 @@ def make_video_vam_pre_post_processors(
         ],
         output_steps=[DeviceProcessorStep(device="cpu")],
     )
+
+
+def make_video_vam_pre_post_processors_from_pretrained(
+    config: VideoVAMConfig,
+    pretrained_path: Any,
+    **kwargs: Any,
+) -> tuple[
+    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+]:
+    """Always rebuild from config: Video-VAM run dirs carry no serialized LeRobot processors."""
+    del pretrained_path, kwargs
+    return make_video_vam_pre_post_processors(config)

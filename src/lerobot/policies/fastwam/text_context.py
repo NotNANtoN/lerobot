@@ -247,7 +247,7 @@ class TextContextArtifact:
 
     @property
     def shape(self) -> tuple[int, int, int]:
-        return tuple(self.context.shape)  # type: ignore[return-value]
+        return tuple(self.context.shape)
 
     def validate_prompts(self, prompts: str | Sequence[str]) -> None:
         values = _normalize_prompts(prompts)

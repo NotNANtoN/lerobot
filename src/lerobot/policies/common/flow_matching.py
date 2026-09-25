@@ -68,6 +68,8 @@ def euler_integrate(
     inference_delay: int | None = None,
     prev_chunk_left_over: Tensor | None = None,
     execution_horizon: int | None = None,
+    hard_prefix: Tensor | None = None,
+    hard_prefix_mask: Tensor | None = None,
 ) -> Tensor:
     """Forward-Euler integration of a velocity field from t=1 (noise) to t=0 (actions).
 
@@ -89,9 +91,15 @@ def euler_integrate(
         inference_delay: RTC guidance parameter, forwarded verbatim.
         prev_chunk_left_over: RTC guidance parameter, forwarded verbatim.
         execution_horizon: RTC guidance parameter, forwarded verbatim.
+        hard_prefix: Optional clean action prefix to clamp throughout denoising.
+        hard_prefix_mask: Boolean mask selecting the values clamped from ``hard_prefix``.
     """
     bsize = noise.shape[0]
     device = noise.device
+
+    guidance = rtc_processor if rtc_enabled else None
+    if rtc_enabled and guidance is None:
+        raise ValueError("rtc_processor is required when rtc_enabled is True")
 
     dt = -1.0 / num_steps
     x_t = noise
@@ -99,11 +107,18 @@ def euler_integrate(
         time = 1.0 + step * dt
         time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
-        def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+        if hard_prefix is not None:
+            if hard_prefix_mask is None:
+                raise ValueError("hard_prefix_mask is required when hard_prefix is provided")
+            x_t = torch.where(hard_prefix_mask, hard_prefix, x_t)
+            time_tensor = time_tensor[:, None].expand(bsize, x_t.shape[1]).clone()
+            time_tensor[hard_prefix_mask[..., 0]] = 0.0
+
+        def denoise_step_partial_call(input_x_t: Tensor, current_timestep: Tensor = time_tensor) -> Tensor:
             return denoise_fn(input_x_t, current_timestep)
 
-        if rtc_enabled:
-            v_t = rtc_processor.denoise_step(
+        if guidance is not None:
+            v_t = guidance.denoise_step(
                 x_t=x_t,
                 prev_chunk_left_over=prev_chunk_left_over,
                 inference_delay=inference_delay,
@@ -115,6 +130,9 @@ def euler_integrate(
             v_t = denoise_step_partial_call(x_t)
 
         x_t = x_t + dt * v_t
+
+        if hard_prefix is not None:
+            x_t = torch.where(hard_prefix_mask, hard_prefix, x_t)
 
         if rtc_processor is not None and rtc_processor.is_debug_enabled():
             rtc_processor.track(time=time, x_t=x_t, v_t=v_t)

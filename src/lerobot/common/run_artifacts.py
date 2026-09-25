@@ -43,14 +43,18 @@ def atomic_write(path: Path, writer: Callable[[Path], None]) -> None:
 
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     content = json.dumps(payload, indent=2, allow_nan=False) + "\n"
-    atomic_write(path, lambda temporary: temporary.write_text(content, encoding="utf-8"))
+
+    def _write(temporary: Path) -> None:
+        temporary.write_text(content, encoding="utf-8")
+
+    atomic_write(path, _write)
 
 
 def code_identity(repo_root: Path) -> dict[str, Any]:
     try:
 
         def git(*args: str) -> str:
-            return subprocess.check_output(
+            return subprocess.check_output(  # nosec B603 B607 - fixed git argv, no shell
                 ["git", "--no-pager", "--no-optional-locks", "-C", str(repo_root), *args],
                 stderr=subprocess.DEVNULL,
                 text=True,

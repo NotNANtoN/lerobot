@@ -195,7 +195,7 @@ class FastWAMPolicy(PreTrainedPolicy):
             model.to(target_device)
         return model
 
-    def get_optim_params(self) -> list[Tensor]:
+    def get_optim_params(self) -> list[torch.nn.Parameter]:
         # Return the trainable tensors directly (a single param group). The optimizer
         # builder wraps these in a param group; returning a bare {"params": [...]} dict
         # instead would make `list(...)` yield the key string "params".
@@ -336,6 +336,11 @@ class FastWAMPolicy(PreTrainedPolicy):
         — see `FastWAM.__init__`. The tokenizer comes from `google/umt5-xxl`.
         """
         dtype = _dtype_from_name(config.torch_dtype)
+        video_dit_config = config.video_dit_config
+        action_dit_config = config.action_dit_config
+        if video_dit_config is None or action_dit_config is None:
+            # FastWAMConfig.__post_init__ always fills both; None here is a programming error.
+            raise ValueError("`FastWAMConfig.video_dit_config` and `action_dit_config` must be resolved.")
         # Build the complete core on CPU so neither model construction nor checkpoint loading
         # needs a second copy of the 6B-parameter state on the 24 GB training GPU.
         construction_device = "cpu"
@@ -345,8 +350,8 @@ class FastWAMPolicy(PreTrainedPolicy):
                 config.text_context_path,
                 expected_provenance=_expected_text_context_provenance(config),
             )
-        video_expert = WanVideoDiT(**config.video_dit_config).to(device=construction_device, dtype=dtype)
-        action_expert = ActionDiT(**config.action_dit_config).to(device=construction_device, dtype=dtype)
+        video_expert = WanVideoDiT(**video_dit_config).to(device=construction_device, dtype=dtype)
+        action_expert = ActionDiT(**action_dit_config).to(device=construction_device, dtype=dtype)
         mot = MoT(
             mixtures={"video": video_expert, "action": action_expert},
             mot_checkpoint_mixed_attn=config.mot_checkpoint_mixed_attn,
@@ -372,7 +377,7 @@ class FastWAMPolicy(PreTrainedPolicy):
                 else None
             ),
             text_context_artifact=text_context_artifact,
-            text_dim=int(config.video_dit_config["text_dim"]),
+            text_dim=int(video_dit_config["text_dim"]),
             proprio_dim=config.proprio_dim,
             device=construction_device,
             torch_dtype=dtype,
@@ -396,7 +401,7 @@ def _expected_text_context_provenance(config: FastWAMConfig) -> TextContextProve
         prompt_template=config.prompt_template,
         tokenizer_max_len=config.tokenizer_max_len,
         context_len=config.context_len,
-        context_dim=int(config.video_dit_config["text_dim"]),
+        context_dim=int((config.video_dit_config or {})["text_dim"]),
     )
 
 
@@ -430,6 +435,7 @@ def _batch_to_infer_kwargs(batch: dict[str, Tensor], config: FastWAMConfig) -> d
         "seed": batch.get("seed", config.inference_seed),
         "rand_device": batch.get("rand_device", config.rand_device),
         "tiled": bool(batch.get("tiled", config.tiled)),
+        "compile_action_infer": bool(batch.get("compile_action_infer", config.compile_action_infer)),
     }
 
 

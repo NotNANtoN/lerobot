@@ -181,6 +181,11 @@ class DatasetInfo:
     data_path: str = field(default=DEFAULT_DATA_PATH)
     video_path: str | None = field(default=DEFAULT_VIDEO_PATH)
 
+    # Format holding the underlying data files. ``None`` means the built-in
+    # parquet/mp4 layout; any other value (e.g. "lance") routes LeRobotDataset's
+    # data access through the storage backend registered for that format.
+    storage_format: str | None = None
+
     # Optional metadata
     robot_type: str | None = None
     splits: dict[str, str] = field(default_factory=dict)
@@ -208,8 +213,8 @@ class DatasetInfo:
         """Return a JSON-serialisable dict.
 
         Converts tuple shapes back to lists so ``json.dump`` can handle them.
-        Drops ``tools`` when unset so existing datasets keep a clean
-        ``info.json``.
+        Drops ``tools`` and ``storage_format`` when unset so existing datasets
+        keep a clean ``info.json``.
         """
         d = dataclasses.asdict(self)
         for ft in d["features"].values():
@@ -217,6 +222,8 @@ class DatasetInfo:
                 ft["shape"] = list(ft["shape"])
         if d.get("tools") is None:
             d.pop("tools", None)
+        if d.get("storage_format") is None:
+            d.pop("storage_format", None)
         return d
 
     @classmethod
@@ -374,7 +381,7 @@ def check_version_compatibility(
     if v_check.major < v_current.major and enforce_breaking_major:
         raise BackwardCompatibilityError(repo_id, v_check)
     elif v_check.minor < v_current.minor:
-        logging.warning(FUTURE_MESSAGE.format(repo_id=repo_id, version=v_check))
+        logger.warning(FUTURE_MESSAGE.format(repo_id=repo_id, version=v_check))
 
 
 def get_repo_versions(repo_id: str, *, token: str | bool | None = None) -> list[packaging.version.Version]:
@@ -441,7 +448,7 @@ def get_safe_version(
     if compatibles:
         return_version = max(compatibles)
         if return_version < target_version:
-            logging.warning(f"Revision {version} for {repo_id} not found, using version v{return_version}")
+            logger.warning(f"Revision {version} for {repo_id} not found, using version v{return_version}")
         return f"v{return_version}"
 
     lower_major = [v for v in hub_versions if v.major < target_version.major]

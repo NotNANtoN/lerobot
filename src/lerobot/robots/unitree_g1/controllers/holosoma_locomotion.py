@@ -22,12 +22,14 @@ import onnx
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 
-from .g1_utils import (
+from ..g1_utils import (
     REMOTE_AXES,
     G1_29_JointArmIndex,
     G1_29_JointIndex,
     get_gravity_orientation,
+    make_ort_session_options,
 )
+from ..unitree_g1 import RobotController
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +80,10 @@ def load_policy(
     logger.info(f"Loading {policy_type.upper()} policy from: {repo_id}/{filename}")
     policy_path = hf_hub_download(repo_id=repo_id, filename=filename)
 
-    policy = ort.InferenceSession(policy_path)
+    # Capped thread pool, same reasoning as GR00T: a small MLP stepped at 50 Hz from a
+    # background thread, where letting ORT take every core starves the control loop.
+    so = make_ort_session_options(intra_op_num_threads=1, inter_op_num_threads=1)
+    policy = ort.InferenceSession(policy_path, sess_options=so)
     logger.info(f"Policy loaded: {policy.get_inputs()[0].shape} → {policy.get_outputs()[0].shape}")
 
     # Extract KP/KD from ONNX metadata
@@ -95,15 +100,16 @@ def load_policy(
     return policy, kp, kd
 
 
-class HolosomaLocomotionController:
+class HolosomaLocomotionController(RobotController):
     """Holosoma lower-body locomotion controller for Unitree G1."""
 
-    control_dt = CONTROL_DT  # Expose for unitree_g1.py
+    control_dt = CONTROL_DT
 
     def __init__(self):
         # Load policy and gains
         self.policy, self.kp, self.kd = load_policy()
 
+        self.default_angles = DEFAULT_ANGLES
         self.cmd = np.zeros(3, dtype=np.float32)
 
         # Robot state

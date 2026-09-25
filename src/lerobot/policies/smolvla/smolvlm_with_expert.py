@@ -316,11 +316,19 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if use_cache:
             if isinstance(past_key_values, tuple):
-                # Static immutable KV cache: no in-place mutation or dynamic allocations
+                # Static immutable KV cache (video-VAM compiled path): no in-place mutation.
                 prefix_k, prefix_v = past_key_values[layer_idx]
                 key_states = torch.cat([prefix_k, key_states.transpose(1, 2)], dim=2).transpose(1, 2)
                 value_states = torch.cat([prefix_v, value_states.transpose(1, 2)], dim=2).transpose(1, 2)
             else:
+                if past_key_values is None:
+                    raise ValueError(
+                        "`use_cache=True` requires a `past_key_values` cache (forward() creates one on prefill)."
+                    )
+                # `DynamicCache` stores tensors as [batch, heads, seq, head_dim]; this module works with
+                # [batch, seq, heads, head_dim]. During prefix prefill this stores the (post-RoPE) K/V and
+                # returns them unchanged; during denoising it appends the suffix K/V and returns
+                # [prefix; suffix], exactly like the previous hand-rolled dict cache.
                 key_states, value_states = past_key_values.update(
                     key_states.transpose(1, 2), value_states.transpose(1, 2), layer_idx
                 )
@@ -460,9 +468,15 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: "DynamicCache | None" = None,
-        inputs_embeds: list[torch.FloatTensor] = None,
+        inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool | None = None,
     ):
+        if inputs_embeds is None:
+            raise ValueError(
+                "`inputs_embeds` is required: pass the [prefix, suffix] embeddings (either may be None)."
+            )
+        # `None` means "no cache", like `False`.
+        use_cache = bool(use_cache)
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
         for hidden_states in inputs_embeds:
