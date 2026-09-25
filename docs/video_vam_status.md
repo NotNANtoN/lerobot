@@ -3,6 +3,16 @@
 **Last updated:** 2026-09-24. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
 Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is authoritative.
 
+## 0. Goals (stated by Anton, 2026-09-24)
+
+1. **Publish.** (a) Joint blog post with Nemo (Hugging Face PEFT maintainer) on using PEFT in LeRobot; the video-LoRA / fast-feature work is a candidate example. (b) Own blog posts / Twitter threads (existing drafts not yet satisfactory).
+2. **A good baseline on a good feature set:** a reliable policy + a defensible choice of visual features to build on.
+3. **Later:** post-training; learn how to train with features in little time and how to train a real robot safely without simulation.
+
+Context: a SmolVLA policy on sort-cubes worked well on the robot (Nov 2025, `Orellius/so101_sort_cubes_no_top_smolvla_base_100k`). On cube-out-of-box no policy has worked yet, even with more data; the cause is unknown. Note: that working policy was _not_ a PEFT or full-VLM fine-tune — it was the standard SmolVLA recipe (frozen vision, action expert trained), BS 32, 200k-step schedule, image transforms, 30 fps data.
+
+Plans: [PEFT blog](./plan_peft_blog.md) · [T=2 distillation](./plan_t2_distillation.md) · [research direction, venues, BFL side goal](./plan_research_direction.md).
+
 ## 1. One-paragraph summary
 
 Frozen or video-LoRA-adapted video DiT features (Cosmos-Predict2-2B, Cosmos 3 Edge, LTX-2.5; Cosmos 7B/14B and FLUX.2 klein to a lesser degree) feed a SmolVLA-style flow-matching action expert ("SmolExpert"). On the cube-out-of-box v1 benchmark the best offline numbers (~13.1 mixed RMSE) beat a 1-hour SmolVLA (14.83) by roughly 1.5 units, but every comparison is **single-seed** on 88 anchors from 8 episodes, and none of the policies achieved a reliable physical grasp. Cosmos 3 Edge (600 tokens, ~80–92 ms extraction) is the most practical backbone. On 2026-09-24 three pipeline bugs were found that invalidate several post-audit online results (see §4).
@@ -25,7 +35,7 @@ Dataset shift inside v1: early vs late episodes differ strongly in joint posture
 | Scale-100 Eval-1 / Eval-2 (provisional, §2) | 13.49 / 17.20 Cosmos 3 Edge video-LoRA                                                                           | — (v2 SmolVLA not scored on this protocol) | —                  |
 | sort-cubes held-out 68–76                   | 15.45 Cosmos 3 Edge (BS 8, local artifact); 14.81 BS 64 (**no local artifact; unverified**)                      | 17.27 @50k                                 | —                  |
 
-Caveats that apply to every row: single seed; no confidence interval; 0.1–0.8 differences are likely within noise; full-30 RMSE is dominated by far-horizon error that RTC never executes; the T=2 undistilled/distilled/teacher-reference weights were lost and must be retrained to re-score.
+Caveats that apply to every row: single seed; no confidence interval; 0.1–0.8 differences are likely within noise; full-30 RMSE is dominated by far-horizon error that RTC never executes; the T=2 undistilled and distilled heads were re-trained on 09-09 (13.65 / 13.48 — the gap shrank from 0.59 to 0.16); only the teacher-reference head is still missing.
 
 ## 4. Open correctness issues (found 2026-09-24, fixed in code, runs not yet redone)
 

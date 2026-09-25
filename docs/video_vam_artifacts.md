@@ -115,7 +115,7 @@ Tests use temporary directories and CPU synthetic data, not real training jobs.
 | **Native Policy** | SmolVLA v1 (train-only stats, 29.2k) | `outputs/train/cube_out_of_box_il_smolvla_train_only_stats_0_31_20260826_1hr/` | ✅ Verified; on Hugging Face                 |
 | **Native Policy** | SmolVLA v2 (scale-100, 25k)          | `outputs/train/cube_out_of_box_scale100_smolvla_1hr/`                          | ⚠️ Saved; v2 dataset integrity unresolved    |
 
-> This inventory is a 2026-09-08 snapshot. Later runs (Scale-100, Phase 6 online, sort-cubes) live under `outputs/train/` on abakus and are listed with their run dirs in the [leaderboard](./video_vam_leaderboard.md). Re-audit before relying on this table.
+> This inventory is a 2026-09-08 snapshot. Update 09-24: the Cosmos 2B T=2 undistilled head, distilled LoRA and distilled head were re-trained on 09-09 and exist on abakus (`outputs/train/cosmos2b-t2-{undistilled,distilled}-smolexpert`, `cosmos2b-t2-direct-distilled-lora`); only the teacher `cond_frames` head is still missing. Later runs (Scale-100, Phase 6 online, sort-cubes) live under `outputs/train/` on abakus and are listed with their run dirs in the [leaderboard](./video_vam_leaderboard.md). Re-audit before relying on this table.
 
 _Rules:_
 

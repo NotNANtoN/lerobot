@@ -22,14 +22,14 @@ Keep Mac and abakus checkouts at the same commit (`sync-to-abakus.sh` / `sync-fr
 
 Defined in `run_mac_vam_rpc.py` (paths on abakus). Status as of 2026-09-24:
 
-| Alias                                               | Run dir                                          | Status                                                              |
-| :-------------------------------------------------- | :----------------------------------------------- | :------------------------------------------------------------------ |
-| `cosmos3_lora` (default)                            | `v2-cosmos3-edge-lora-smolexpert`                | Scale-100 leader (provisional dataset)                              |
-| `cosmos3_aug_v1` / `cosmos3_aug_v2`                 | `v{1,2}-cosmos3-edge-lora-online-aug-smolexpert` | online-aug runs                                                     |
-| `cosmos3_base`                                      | `cosmos3-edge-undseq-smolexpert`                 | pre-routing-fix zero-shot                                           |
-| `cosmos2b_t16`                                      | `cube-out-of-box-cosmos-pool2-smolexpert`        | T=16, ~1.2 s per chunk                                              |
-| `cosmos2b_t2_undistilled` / `cosmos2b_t2_distilled` | `cosmos2b-t2-{undistilled,distilled}-smolexpert` | weights were missing on 09-08; check they were retrained before use |
-| `smolvla_v1` / `smolvla_v2`                         | SmolVLA 29.2k (v1) / 25k (Scale-100)             | baselines                                                           |
+| Alias                                               | Run dir                                          | Status                                 |
+| :-------------------------------------------------- | :----------------------------------------------- | :------------------------------------- |
+| `cosmos3_lora` (default)                            | `v2-cosmos3-edge-lora-smolexpert`                | Scale-100 leader (provisional dataset) |
+| `cosmos3_aug_v1` / `cosmos3_aug_v2`                 | `v{1,2}-cosmos3-edge-lora-online-aug-smolexpert` | online-aug runs                        |
+| `cosmos3_base`                                      | `cosmos3-edge-undseq-smolexpert`                 | pre-routing-fix zero-shot              |
+| `cosmos2b_t16`                                      | `cube-out-of-box-cosmos-pool2-smolexpert`        | T=16, ~1.2 s per chunk                 |
+| `cosmos2b_t2_undistilled` / `cosmos2b_t2_distilled` | `cosmos2b-t2-{undistilled,distilled}-smolexpert` | re-trained 09-09 (13.65 / 13.48 on v1) |
+| `smolvla_v1` / `smolvla_v2`                         | SmolVLA 29.2k (v1) / 25k (Scale-100)             | baselines                              |
 
 Action flow steps: checkpoints default to 10 Euler steps. For lower latency start the server with `--euler-steps 3` (explicit; record it in the test log).
 
