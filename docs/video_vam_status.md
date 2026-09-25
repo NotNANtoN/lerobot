@@ -11,6 +11,8 @@ Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is aut
 
 Context: a SmolVLA policy on sort-cubes worked well on the robot (Nov 2025, `Orellius/so101_sort_cubes_no_top_smolvla_base_100k`). On cube-out-of-box no policy has worked yet, even with more data; the cause is unknown. Note: that working policy was _not_ a PEFT or full-VLM fine-tune — it was the standard SmolVLA recipe (frozen vision, action expert trained), BS 32, 200k-step schedule, image transforms, 30 fps data.
 
+Upstream: merged huggingface/lerobot `main` @ `e624f3f7` on 2026-09-25 (adds FLUX 3 Action `lerobot.policies.flux3`). Robot data note: our SO-101 setups have a **wrist camera only** (F3A expects scene + wrist).
+
 Plans: [PEFT blog](./plan_peft_blog.md) · [T=2 distillation](./plan_t2_distillation.md) · [research direction, venues, BFL side goal](./plan_research_direction.md).
 
 ## 1. One-paragraph summary

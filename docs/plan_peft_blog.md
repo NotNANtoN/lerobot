@@ -10,6 +10,13 @@
 - **The Video-VAM code does not use PEFT.** Five hand-written LoRA stacks: `policies/vam/cosmos_lora.py`, `cosmos3_lora.py`, `cosmos7b_lora.py`, `cosmos14b_lora.py`, `flux2_klein_lora.py` (+ `base/lora.py`). The alpha-mismatch bug found on 2026-09-24 (trained α=16, loaded α=32) is exactly the class of bug PEFT's `adapter_config.json` prevents.
 - Therefore the post is also a **migration**: showing Nemo our custom code as a "PEFT example" would not land. Porting to PEFT is the first deliverable.
 
+## 1b. FLUX 3 Action (released 2026-09-22) — likely the better centrepiece
+
+- Open 7B world-action model; LeRobot-native (`lerobot.policies.flux3`, extra `flux3`, merged into this fork on 2026-09-25). Hub: `black-forest-labs/flux-3-action-{base,so101,droid}`. BFL thanks HF/LeRobot for "testing PEFT on SO-101" — ask Nemo what already exists.
+- SO-101 recipe: `lerobot-train --config_path=lora.json` (rank/alpha 32, BF16, gradient checkpointing, batch 2 × accum 4, 10k microsteps = 2.5k updates; heads trained fully). ~200 demos per task in their examples.
+- **Contract mismatch for us:** checkpoint expects **two cameras** (`scene` left + `wrist` right, 256×256 each → 512×256 canvas) at **30 Hz**, joint-delta actions + absolute gripper, predict 42 / execute 32. Our sort-cubes data has **only a wrist camera** (no scene camera). Options: (a) record a few episodes with an added scene camera; (b) feed the wrist view as the only camera (duplicate or blank the other half) and LoRA-adapt — degrades the pretrained prior, needs testing; (c) full fine-tune of heads + larger LoRA. (a) is cleanest for a blog post.
+- **4090 feasibility (unverified):** BFL reports ~32 GB for BF16 _inference_ incl. Qwen3-VL-4B text encoder and VAE. Needs cached prompt embedding / text-encoder offload and probably FP8 to fit 24 GB. LoRA training memory not published. This measurement is itself useful blog content.
+
 ## 2. Candidate storylines (pick one primary)
 
 | #   | Story                                                                                                                                                                                 | Why it is good                                                                                                                                                 | Risk / cost                                                                                                                                                                        |
