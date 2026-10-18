@@ -15,9 +15,12 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from lerobot.configs import (
     FeatureType,
@@ -213,7 +216,11 @@ class FastWAMConfig(PreTrainedConfig):
     tokenizer_max_len: int = 128
     load_text_encoder: bool = True
     mot_checkpoint_mixed_attn: bool = False
-    torch_dtype: str = "bfloat16"
+    dtype: torch.dtype | None = torch.bfloat16
+
+    # Deprecated and ignored: superseded by `dtype`. Declared only so configs written before the
+    # rename still parse — draccus rejects config.json keys the dataclass no longer declares.
+    torch_dtype: str | None = None
     prompt_template: str = (
         "A video recorded from a robot's point of view executing the following instruction: {task}"
     )
@@ -253,7 +260,19 @@ class FastWAMConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1.0e-2
 
     def __post_init__(self) -> None:
+        if self.torch_dtype is not None:
+            warnings.warn(
+                "`torch_dtype` is deprecated; use `--policy.dtype` instead.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            self.torch_dtype = None
+
         super().__post_init__()
+        if self.dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+            raise ValueError(
+                f"Unsupported dtype={self.dtype!r}. Expected torch.float32, torch.float16 or torch.bfloat16."
+            )
         image_height, image_width = self.image_size
         self.image_size = (image_height, image_width)
         if type(self.lora_rank) is not int or self.lora_rank < 0:

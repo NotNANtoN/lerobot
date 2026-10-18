@@ -335,7 +335,11 @@ class FastWAMPolicy(PreTrainedPolicy):
         across checkpoints) and are intentionally excluded from `model.safetensors`
         — see `FastWAM.__init__`. The tokenizer comes from `google/umt5-xxl`.
         """
-        dtype = _dtype_from_name(config.torch_dtype)
+        dtype = config.dtype
+        device = config.device
+        if device is None:
+            # PreTrainedConfig.__post_init__ always resolves a device; None here is a programming error.
+            raise ValueError("`FastWAMConfig.device` is unset; cannot build the FastWAM core model.")
         video_dit_config = config.video_dit_config
         action_dit_config = config.action_dit_config
         if video_dit_config is None or action_dit_config is None:
@@ -397,7 +401,7 @@ def _expected_text_context_provenance(config: FastWAMConfig) -> TextContextProve
         model_id=config.model_id,
         tokenizer_model_id=config.tokenizer_model_id,
         text_encoder_model_id=config.text_encoder_model_id,
-        dtype=config.torch_dtype,
+        dtype=str(config.dtype).removeprefix("torch."),
         prompt_template=config.prompt_template,
         tokenizer_max_len=config.tokenizer_max_len,
         context_len=config.context_len,
@@ -485,13 +489,6 @@ def _slice_infer_value(value: Any, *, index: int, batch_size: int) -> Any:
     if isinstance(value, (list, tuple)) and len(value) == batch_size:
         return value[index]
     return value
-
-
-def _dtype_from_name(name: str) -> torch.dtype:
-    dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-    if name not in dtype_map:
-        raise ValueError(f"Unsupported torch dtype `{name}`.")
-    return dtype_map[name]
 
 
 def batch_device(batch: dict[str, Any]) -> torch.device:
