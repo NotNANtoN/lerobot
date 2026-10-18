@@ -10,8 +10,13 @@ from diffusers.models.transformers.transformer_cosmos3 import Cosmos3OmniTransfo
 
 from lerobot.policies.vam.cosmos3_lora import (
     DUAL_PATHWAY_TARGET_MODULES,
+    GEN_TARGET_MODULES,
+    convert_legacy_cosmos3_lora_to_peft,
+    cosmos3_lora_config,
     inject_cosmos3_lora,
     load_cosmos3_lora,
+    load_cosmos3_peft_adapter,
+    read_cosmos3_adapter_hyperparameters,
     save_cosmos3_lora,
 )
 from lerobot.policies.vam.cosmos_lora import LoRALinear
@@ -136,6 +141,62 @@ def test_save_and_load_cosmos3_lora_with_metadata() -> None:
         for _name, p in transformer2.named_parameters():
             if p.requires_grad:
                 assert torch.allclose(p, torch.full_like(p, 0.42))
+
+
+def _layer_outputs(transformer: Cosmos3OmniTransformer) -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(1)
+    und, gen = torch.randn(5, 64), torch.randn(8, 64)
+    rotary = (torch.ones(5, 16), torch.zeros(5, 16), torch.ones(8, 16), torch.zeros(8, 16))
+    with torch.no_grad():
+        return transformer.layers[1](*transformer.layers[0](und, gen, rotary), rotary)
+
+
+def test_peft_config_targets_match_legacy_injection() -> None:
+    peft = pytest.importorskip("peft")
+    legacy = build_tiny_real_cosmos3_transformer(num_layers=3)
+    wrapped = set(inject_cosmos3_lora(legacy, rank=4, alpha=8.0, block_indices=[0, 2]))
+    model = peft.get_peft_model(
+        build_tiny_real_cosmos3_transformer(num_layers=3),
+        cosmos3_lora_config(rank=4, alpha=8.0, block_indices=[0, 2]),
+    )
+    peft_wrapped = {
+        name.removeprefix("base_model.model.").removesuffix(".lora_A")
+        for name, _ in model.named_modules()
+        if name.endswith(".lora_A")
+    }
+    assert peft_wrapped == wrapped
+    assert sum(p.numel() for p in model.parameters() if p.requires_grad) == sum(
+        p.numel() for p in legacy.parameters() if p.requires_grad
+    )
+
+
+def test_legacy_lora_converts_to_peft_with_identical_outputs(tmp_path: Path) -> None:
+    pytest.importorskip("peft")
+    torch.manual_seed(0)
+    base_state = build_tiny_real_cosmos3_transformer(num_layers=2).state_dict()
+    legacy = build_tiny_real_cosmos3_transformer(num_layers=2)
+    legacy.load_state_dict(base_state)
+    inject_cosmos3_lora(legacy, rank=4, alpha=16.0, target_modules=GEN_TARGET_MODULES)
+    with torch.no_grad():
+        for p in legacy.parameters():
+            if p.requires_grad:
+                p.normal_(std=0.05)  # non-zero B so the adapter actually changes the output
+    save_cosmos3_lora(legacy, tmp_path / "legacy.safetensors", rank=4, alpha=16.0)
+    expected = _layer_outputs(legacy)
+
+    adapter = convert_legacy_cosmos3_lora_to_peft(tmp_path / "legacy.safetensors", tmp_path / "peft")
+    assert read_cosmos3_adapter_hyperparameters(adapter) == (4, 16.0)
+
+    for merge in (False, True):
+        fresh = build_tiny_real_cosmos3_transformer(num_layers=2)
+        fresh.load_state_dict(base_state)
+        base_out = _layer_outputs(fresh)
+        adapted = load_cosmos3_peft_adapter(fresh, adapter, merge=merge)
+        got = _layer_outputs(adapted)
+        assert not torch.allclose(base_out[1], expected[1])
+        for g, e in zip(got, expected, strict=True):
+            torch.testing.assert_close(g, e, atol=1e-5, rtol=1e-5)
+        assert not any(p.requires_grad for p in adapted.parameters())
 
 
 def test_load_cosmos3_lora_missing_file_error() -> None:

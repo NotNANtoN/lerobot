@@ -1,0 +1,24 @@
+# FLUX 3 Action SO-101 LoRA on cube-out-of-box v1 (10 Hz, wrist-only W1), Protocol 1.0 train eps 0-31.
+#! trainer: lerobot-train
+# Base: flux-3-action-so101 with cube-v1 train-episode quantiles and a 10 Hz contract
+# (export_flux3_recalibrated_base.py --fps 10 --chunk-size 32 --n-action-steps 10 -> outputs/bases/flux3-so101-cubev1-10hz).
+# fps 10 (video positions 8 fps, same ratio as the 30/24 checkpoint), chunk 32 (3.2 s; 30 scored), execute 10.
+# Offline eval on val eps 32-39 (88 anchors): evaluate_flux3_action_rmse.py --dataset-repo-id hubnemo/cube_out_of_box_dataset
+#   --dataset-revision 243370c3c08bcbd860133c4a0d658ea7c1d2e77e --train-episodes 0:32 --eval-episodes 32:40
+--config_path=examples/flux3/lora.json
+--policy.path=outputs/bases/flux3-so101-cubev1-10hz
+--policy.device=cuda
+--policy.text_encoder_on_cpu=true
+--policy.camera_keys='["observation.images.wrist","observation.images.wrist"]'
+--rename_map='{"observation.images.front":"observation.images.wrist"}'
+--dataset.repo_id=hubnemo/cube_out_of_box_dataset
+--dataset.revision=243370c3c08bcbd860133c4a0d658ea7c1d2e77e
+--dataset.episodes=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+--dataset.eval_split=0.0
+--dataset.video_backend=torchcodec
+--eval_steps=0
+--wandb.enable=false
+--save_freq=2500
+--log_freq=50
+--output_dir=outputs/train/${RUN_TAG}
+--job_name=${RUN_TAG}

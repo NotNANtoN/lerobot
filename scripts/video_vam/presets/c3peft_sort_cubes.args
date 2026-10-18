@@ -1,0 +1,13 @@
+# SmolExpert on Cosmos 3 Edge features with the sort-cubes PEFT video-LoRA (twin of c3_sort_cubes, 15.45 with the cube-v1 adapter).
+#! include: _smolexpert_online_base
+#! include: _sort_cubes
+--online-backbone cosmos3_edge
+--backbone-checkpoint /home/anton/.cache/video-vam/cosmos3-edge
+--backbone-lora-weights outputs/train/cosmos3-edge-sort-cubes-peft-lora/best_adapter
+--backbone-layer 20
+--backbone-prompt 'Grab the purple cube and put it into the cardboard box, ignore the other objects'
+--dataset-revision a7c156de0e84a81e19457e6d783e4316e9f901e1
+--no-augment
+--min-steps 5000
+--max-steps 25000
+--num-steps 3

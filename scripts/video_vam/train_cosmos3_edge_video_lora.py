@@ -28,6 +28,7 @@ from lerobot.policies.vam.cosmos3_lora import (
     DUAL_PATHWAY_TARGET_MODULES,
     GEN_TARGET_MODULES,
     UND_TARGET_MODULES,
+    cosmos3_lora_config,
     inject_cosmos3_lora,
     save_cosmos3_lora,
 )
@@ -49,8 +50,27 @@ DEFAULT_CACHE_DIR = Path("/home/anton/.cache/video-vam/cosmos3-edge-latents-cach
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
-    parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--dataset-repo-id", type=str, default="hubnemo/cube_out_of_box_dataset")
+    parser.add_argument(
+        "--dataset-root", type=Path, default=None, help="local root (default: cube v1 cache or HF cache)"
+    )
+    parser.add_argument("--dataset-repo-id", type=str, default=CUBE_OUT_OF_BOX_CONTRACT.repo_id)
+    parser.add_argument(
+        "--dataset-revision", type=str, default=None, help="commit sha (required for non-cube datasets)"
+    )
+    parser.add_argument("--camera-key", type=str, default="observation.images.front")
+    parser.add_argument(
+        "--frame-step",
+        type=int,
+        default=1,
+        help="take every n-th dataset frame; video fps given to the model = dataset fps / frame-step",
+    )
+    parser.add_argument("--prompt", type=str, default="take cube out of box")
+    parser.add_argument(
+        "--adapter-format",
+        choices=["peft", "legacy"],
+        default="peft",
+        help="peft: PEFT LoraConfig + save_pretrained (best_adapter/); legacy: LoRALinear safetensors",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--protocol", choices=["protocol1", "scale100"], default="protocol1")
@@ -83,15 +103,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_clip_indices(
-    dataset: LeRobotDataset, episodes: list[int], stride: int, clip_frames: int
+    dataset: LeRobotDataset, episodes: list[int], stride: int, clip_frames: int, frame_step: int = 1
 ) -> list[tuple[int, int]]:
-    """Return list of (episode, start_frame) tuples."""
+    """Return list of (episode, start_frame) tuples whose whole (strided) clip lies in the episode."""
+    span = (clip_frames - 1) * frame_step + 1
     samples = []
     for ep in episodes:
         row = dataset.meta.episodes[ep]
         from_idx = int(row["dataset_from_index"])
         to_idx = int(row["dataset_to_index"])
-        max_start = to_idx - clip_frames
+        max_start = to_idx - span
         for f in range(from_idx, max_start + 1, stride):
             samples.append((ep, f))
     return samples
@@ -105,6 +126,9 @@ def preencode_latents(
     clip_frames: int,
     device: torch.device,
     cache_meta: dict[str, Any] | None = None,
+    *,
+    camera_key: str = "observation.images.front",
+    frame_step: int = 1,
 ) -> torch.Tensor:
     """Precompute and cache VAE latents [N, 48, T_lat, 30, 40] with native posterior mode and mean/std normalization."""
     meta_path = cache_path.with_suffix(".json")
@@ -130,10 +154,9 @@ def preencode_latents(
     t0 = time.time()
     for idx, (_ep, start_f) in enumerate(samples):
         frames = []
-        for f in range(start_f, start_f + clip_frames):
+        for f in range(start_f, start_f + clip_frames * frame_step, frame_step):
             item = dataset[_relative_index(dataset, f)]
-            img = item.get("observation.images.front", item.get("observation.images.phone"))
-            frames.append(img)
+            frames.append(item[camera_key])
         rgb_clip = torch.stack(frames, dim=1).unsqueeze(0).to(device=device)
 
         with torch.no_grad():
@@ -167,10 +190,21 @@ def preencode_latents(
 def main() -> int:
     args = parse_args()
 
-    # Enforce strict Protocol 1.0 train/val episode disjointness
-    enforce_protocol_1_0_split(
-        args.train_episodes, args.val_episodes, allow_subset=True, protocol=args.protocol
-    )
+    is_cube = args.dataset_repo_id == CUBE_OUT_OF_BOX_CONTRACT.repo_id
+    if is_cube:
+        # Enforce strict Protocol 1.0 train/val episode disjointness
+        enforce_protocol_1_0_split(
+            args.train_episodes, args.val_episodes, allow_subset=True, protocol=args.protocol
+        )
+        args.dataset_revision = args.dataset_revision or CUBE_OUT_OF_BOX_CONTRACT.revision
+        args.dataset_root = args.dataset_root or DEFAULT_DATASET_ROOT
+    else:
+        if not args.dataset_revision:
+            raise ValueError("--dataset-revision (commit sha) is required for non-cube datasets")
+        if set(args.train_episodes) & set(args.val_episodes):
+            raise ValueError("train/val episodes overlap")
+    if args.frame_step < 1:
+        raise ValueError("--frame-step must be >= 1")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -190,14 +224,20 @@ def main() -> int:
     print("Loading LeRobot dataset...")
     dataset = LeRobotDataset(
         args.dataset_repo_id,
-        root=str(args.dataset_root),
-        revision=CUBE_OUT_OF_BOX_CONTRACT.revision,
+        root=str(args.dataset_root) if args.dataset_root else None,
+        revision=args.dataset_revision,
         return_uint8=True,
         download_videos=False,
     )
+    video_fps = float(dataset.meta.fps) / args.frame_step
+    print(f"Dataset fps {dataset.meta.fps}, frame step {args.frame_step} -> model video fps {video_fps:g}")
 
-    train_samples = get_clip_indices(dataset, args.train_episodes, args.train_stride, args.clip_frames)
-    val_samples = get_clip_indices(dataset, args.val_episodes, args.val_stride, args.clip_frames)
+    train_samples = get_clip_indices(
+        dataset, args.train_episodes, args.train_stride, args.clip_frames, args.frame_step
+    )
+    val_samples = get_clip_indices(
+        dataset, args.val_episodes, args.val_stride, args.clip_frames, args.frame_step
+    )
     if not train_samples or not val_samples:
         raise ValueError("Both train and validation selections must contain complete clips")
     print(f"Found {len(train_samples)} training clips and {len(val_samples)} validation clips.")
@@ -211,27 +251,33 @@ def main() -> int:
     chk_sha = checkpoint_digest(args.checkpoint_dir)
 
     # 1. Precompute or load VAE latents with honest cache key verification
+    # Camera and frame step are part of the preprocessing identity (v2 keys stay valid for cube v1).
+    preprocessing_version = (
+        "cosmos3_native_v2"
+        if args.frame_step == 1 and args.camera_key == "observation.images.front"
+        else f"cosmos3_native_v2|{args.camera_key}|step{args.frame_step}"
+    )
     train_cache_key = compute_cosmos3_cache_key(
         dataset_repo=args.dataset_repo_id,
-        dataset_revision=CUBE_OUT_OF_BOX_CONTRACT.revision,
+        dataset_revision=args.dataset_revision,
         episodes=args.train_episodes,
         stride=args.train_stride,
         clip_frames=args.clip_frames,
         hidden_layer=20,
-        fps=10.0,
+        fps=video_fps,
         checkpoint_sha256=chk_sha,
-        preprocessing_version="cosmos3_native_v2",
+        preprocessing_version=preprocessing_version,
     )
     val_cache_key = compute_cosmos3_cache_key(
         dataset_repo=args.dataset_repo_id,
-        dataset_revision=CUBE_OUT_OF_BOX_CONTRACT.revision,
+        dataset_revision=args.dataset_revision,
         episodes=args.val_episodes,
         stride=args.val_stride,
         clip_frames=args.clip_frames,
         hidden_layer=20,
-        fps=10.0,
+        fps=video_fps,
         checkpoint_sha256=chk_sha,
-        preprocessing_version="cosmos3_native_v2",
+        preprocessing_version=preprocessing_version,
     )
 
     train_cache_file = (
@@ -252,6 +298,8 @@ def main() -> int:
             "stride": args.train_stride,
             "samples": train_samples,
         },
+        camera_key=args.camera_key,
+        frame_step=args.frame_step,
     )
     val_latents = preencode_latents(
         pipe,
@@ -266,6 +314,8 @@ def main() -> int:
             "stride": args.val_stride,
             "samples": val_samples,
         },
+        camera_key=args.camera_key,
+        frame_step=args.frame_step,
     )
 
     # Free VAE to reclaim memory for training
@@ -290,21 +340,35 @@ def main() -> int:
     else:
         raise ValueError(f"Unknown pathway: {args.pathway}")
 
-    wrapped_layers = inject_cosmos3_lora(
-        pipe.transformer,
-        rank=args.rank,
-        alpha=args.alpha,
-        block_indices=range(len(pipe.transformer.layers)),
-        target_modules=targets,
-    )
-    trainable_params = [p for p in pipe.transformer.parameters() if p.requires_grad]
+    pipe.transformer.enable_gradient_checkpointing()
+    if args.adapter_format == "peft":
+        from peft import get_peft_model
+
+        for p in pipe.transformer.parameters():
+            p.requires_grad_(False)
+        lora_config = cosmos3_lora_config(rank=args.rank, alpha=args.alpha, target_modules=targets)
+        # fp32 adapter weights on the bf16 base (autocast_adapter_dtype), as with LoRALinear.
+        model = get_peft_model(pipe.transformer, lora_config)
+        # get_peft_model overwrites this from the (unset) model name; record the real base.
+        model.peft_config["default"].base_model_name_or_path = str(args.checkpoint_dir / "transformer")
+        num_wrapped = sum(1 for n, _ in model.named_modules() if n.endswith(".lora_A"))
+    else:
+        wrapped_layers = inject_cosmos3_lora(
+            pipe.transformer,
+            rank=args.rank,
+            alpha=args.alpha,
+            block_indices=range(len(pipe.transformer.layers)),
+            target_modules=targets,
+        )
+        model = pipe.transformer
+        num_wrapped = len(wrapped_layers)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     num_trainable = sum(p.numel() for p in trainable_params)
     print(
-        f"LoRA injected into {len(wrapped_layers)} linear modules ({num_trainable / 1e6:.2f}M trainable parameters)."
+        f"LoRA ({args.adapter_format}) injected into {num_wrapped} linear modules "
+        f"({num_trainable / 1e6:.2f}M trainable parameters)."
     )
-
-    pipe.transformer.enable_gradient_checkpointing()
-    pipe.transformer.train()
+    model.train()
 
     optimizer = torch.optim.AdamW(
         trainable_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99)
@@ -320,18 +384,18 @@ def main() -> int:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Pre-pack text segment (static prompt: 'take cube out of box')
-    prompt_text = "take cube out of box"
+    # Pre-pack text segment (static task prompt)
+    prompt_text = args.prompt
     prompt_tokens = pipe.text_tokenizer(prompt_text).input_ids
     text_seg = pipe._prepare_text_segment(input_ids=prompt_tokens, device=device)
 
-    # Pre-pack vision segment layout with real dataset FPS 10.0
+    # Pre-pack vision segment layout with the true video fps of the clips
     sample_latent = torch.zeros_like(train_latents[:1], device=device)
     vision_seg = pipe._prepare_vision_segment(
         input_vision_tokens=sample_latent,
         has_image_condition=True,
         mrope_offset=text_seg["vision_start_temporal_offset"],
-        vision_fps=10.0,
+        vision_fps=video_fps,
         curr=text_seg["und_len"],
         device=device,
         condition_frame_indexes=[0, 1],
@@ -372,7 +436,7 @@ def main() -> int:
             if device.type == "cuda"
             else nullcontext()
         ):
-            preds_vision, _, _ = pipe.transformer(
+            preds_vision, _, _ = model(
                 input_ids=text_seg["input_ids"],
                 text_indexes=text_seg["text_indexes"],
                 position_ids=position_ids,
@@ -404,7 +468,7 @@ def main() -> int:
 
         # Validation
         if step % args.val_every == 0 or step == args.max_steps:
-            pipe.transformer.eval()
+            model.eval()
             val_losses = []
             val_rng = random.Random(args.seed + 999)
             val_generator.manual_seed(args.seed + 999)
@@ -422,7 +486,7 @@ def main() -> int:
                         v_tgt = eps[:, :, 2:] - v_clean[:, :, 2:]
                         v_timesteps = torch.full((num_noisy_tokens,), t_eval.item(), device=device)
 
-                        preds, _, _ = pipe.transformer(
+                        preds, _, _ = model(
                             input_ids=text_seg["input_ids"],
                             text_indexes=text_seg["text_indexes"],
                             position_ids=position_ids,
@@ -440,7 +504,7 @@ def main() -> int:
                         val_losses.append(v_loss)
 
             mean_val_loss = sum(val_losses) / len(val_losses)
-            pipe.transformer.train()
+            model.train()
             print(
                 f"*** Step {step:05d} VALIDATION: Mean Loss = {mean_val_loss:.4f} (best: {best_val_loss:.4f}) ***"
             )
@@ -448,21 +512,33 @@ def main() -> int:
             if mean_val_loss < best_val_loss:
                 best_val_loss = mean_val_loss
                 patience_count = 0
-                best_lora_path = output_dir / "best_lora.safetensors"
-                save_cosmos3_lora(
-                    pipe.transformer,
-                    best_lora_path,
-                    rank=args.rank,
-                    alpha=args.alpha,
-                    target_modules=targets,
-                )
+                if args.adapter_format == "peft":
+                    best_lora_path = output_dir / "best_adapter"
+                    # Explicit: PEFT's "auto" embedding-resize check calls config.from_pretrained, which
+                    # diffusers' FrozenDict config lacks (crashes once base_model_name_or_path is set).
+                    model.save_pretrained(str(best_lora_path), save_embedding_layers=False)
+                else:
+                    best_lora_path = output_dir / "best_lora.safetensors"
+                    save_cosmos3_lora(
+                        pipe.transformer,
+                        best_lora_path,
+                        rank=args.rank,
+                        alpha=args.alpha,
+                        target_modules=targets,
+                    )
                 provenance_info = {
                     "step": step,
                     "val_loss": best_val_loss,
                     "checkpoint_sha256": chk_sha,
                     "train_cache_key": train_cache_key,
                     "val_cache_key": val_cache_key,
-                    "preprocessing_version": "cosmos3_native_v2",
+                    "preprocessing_version": preprocessing_version,
+                    "dataset": f"{args.dataset_repo_id}@{args.dataset_revision}",
+                    "camera_key": args.camera_key,
+                    "frame_step": args.frame_step,
+                    "video_fps": video_fps,
+                    "prompt": args.prompt,
+                    "adapter_format": args.adapter_format,
                     "train_episodes": args.train_episodes,
                     "val_episodes": args.val_episodes,
                     "time": time.time(),
@@ -479,6 +555,9 @@ def main() -> int:
                     json.dump(provenance_info, f, indent=2)
                 with open(output_dir / "best_lora.json", "w") as f:
                     json.dump(provenance_info, f, indent=2)
+                if args.adapter_format == "peft":
+                    with open(best_lora_path / "provenance.json", "w") as f:
+                        json.dump(provenance_info, f, indent=2)
                 print(f"Saved new best LoRA to {best_lora_path}!")
             else:
                 patience_count += 1

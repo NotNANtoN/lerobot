@@ -438,14 +438,24 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
         # 2. Load LoRA if requested
         if config.lora_checkpoint is not None:
-            from lerobot.policies.vam.cosmos3_lora import load_cosmos3_lora
-
-            load_cosmos3_lora(
-                self.transformer,
-                config.lora_checkpoint,
-                rank=config.lora_rank,
-                alpha=config.lora_alpha,
+            from lerobot.policies.vam.cosmos3_lora import (
+                is_peft_adapter,
+                load_cosmos3_lora,
+                load_cosmos3_peft_adapter,
             )
+
+            if is_peft_adapter(config.lora_checkpoint):
+                # Unmerged: identical numerics to the legacy fp32 LoRALinear branch.
+                self.transformer = load_cosmos3_peft_adapter(
+                    self.transformer, config.lora_checkpoint, merge=False
+                )
+            else:
+                load_cosmos3_lora(
+                    self.transformer,
+                    config.lora_checkpoint,
+                    rank=config.lora_rank,
+                    alpha=config.lora_alpha,
+                )
 
         # 3. Initialize or assign VAE
         if vae is not None:
@@ -596,9 +606,12 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             if chk_file.is_file():
                 prov["transformer_sha256"] = sha256_file(chk_file)
         if self.config.lora_checkpoint:
+            from lerobot.policies.vam.cosmos3_lora import cosmos3_adapter_weights_file
+
             prov["lora_checkpoint"] = str(self.config.lora_checkpoint)
-            if Path(self.config.lora_checkpoint).is_file():
-                prov["lora_sha256"] = sha256_file(self.config.lora_checkpoint)
+            weights = cosmos3_adapter_weights_file(self.config.lora_checkpoint)
+            if weights.is_file():
+                prov["lora_sha256"] = sha256_file(weights)
             prov["lora_rank"] = self.config.lora_rank
             prov["lora_alpha"] = self.config.lora_alpha
         return prov

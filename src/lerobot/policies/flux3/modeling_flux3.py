@@ -85,6 +85,8 @@ class FrozenComponents:
 
     video_vae: Any
     text_encoder: nn.Module
+    # Keep Qwen on CPU through device moves (24 GB GPUs); embeddings are cached on the policy device.
+    text_encoder_on_cpu: bool = False
 
     def __post_init__(self) -> None:
         for module in self.modules():
@@ -99,6 +101,8 @@ class FrozenComponents:
 
     def _apply(self, fn) -> None:
         for module in self.modules():
+            if self.text_encoder_on_cpu and module is self.text_encoder:
+                continue
             module._apply(fn)
 
 
@@ -144,7 +148,11 @@ class Flux3Policy(PreTrainedPolicy):
             init_config = replace(config, trunk_weights=None)
         self.dit: JointSingleSeq = self._build_dit(init_config)
         self.dit.gradient_checkpointing = config.gradient_checkpointing
-        self.frozen = FrozenComponents(self._build_video_vae(config), self._build_text_encoder(config))
+        self.frozen = FrozenComponents(
+            self._build_video_vae(config),
+            self._build_text_encoder(config),
+            text_encoder_on_cpu=config.text_encoder_on_cpu,
+        )
         self._ctx_cache: dict[str, tuple[Tensor, Tensor]] = {}
         self._compiled_dit: Callable[..., dict[str, Tensor]] | None = None
         self.reset()

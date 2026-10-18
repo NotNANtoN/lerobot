@@ -1,6 +1,6 @@
 # Video-VAM status
 
-**Last updated:** 2026-09-24. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
+**Last updated:** 2026-10-18. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
 Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is authoritative.
 
 ## 0. Goals (stated by Anton, 2026-09-24)
@@ -11,7 +11,7 @@ Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is aut
 
 Context: a SmolVLA policy on sort-cubes worked well on the robot (Nov 2025, `Orellius/so101_sort_cubes_no_top_smolvla_base_100k`). On cube-out-of-box no policy has worked yet, even with more data; the cause is unknown. Note: that working policy was _not_ a PEFT or full-VLM fine-tune — it was the standard SmolVLA recipe (frozen vision, action expert trained), BS 32, 200k-step schedule, image transforms, 30 fps data.
 
-Upstream: merged huggingface/lerobot `main` @ `e624f3f7` on 2026-09-25 (adds FLUX 3 Action `lerobot.policies.flux3`). Robot data note: our SO-101 setups have a **wrist camera only** (F3A expects scene + wrist).
+Upstream: merged huggingface/lerobot `main` @ `e624f3f7` on 2026-09-25 and `146d8474` on 2026-10-18 (adds FLUX 3 Action `lerobot.policies.flux3`, unified policy `dtype` handling, remote rollout engine, rustypot motor bus). Robot data note: our SO-101 setups have a **wrist camera only** (F3A expects scene + wrist).
 
 Plans: [PEFT blog](./plan_peft_blog.md) · [T=2 distillation](./plan_t2_distillation.md) · [FLUX 3 Action / wrist-only](./plan_flux3_action.md) · [research direction, venues, BFL side goal](./plan_research_direction.md).
 
@@ -25,17 +25,17 @@ Frozen or video-LoRA-adapted video DiT features (Cosmos-Predict2-2B, Cosmos 3 Ed
 | :----------------- | :-------------------------------------------------- | :-------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **v1** (canonical) | `hubnemo/cube_out_of_box_dataset` @ `243370c3…`     | 40 / 6,536 @ 10 fps                                             | Protocol 1.0: train 0–31, val 32–39 (88 anchors, stride 20)                                                                                                                                                                                                         |
 | **v2 / Scale-100** | `Orellius/cube_out_of_box_v2` @ `5d0325cc…`         | metadata says 100 / 12,163; files contain 140 eps / 15,998 rows | **Integrity unresolved.** The 09-08 quarantine was never formally lifted, but all Scale-100 and Phase 6 runs used this snapshot (train 0–31 + 40–89, Eval-1 32–39, Eval-2 90–99). Treat Scale-100 numbers as provisional until the extra 40 episodes are explained. |
-| **sort-cubes**     | `Orellius/so101_sort_cubes_no_top` @ _not recorded_ | 77 eps @ 30 fps                                                 | Held out 68–76. Different task and dataset: **not comparable** to cube numbers. Runs before 09-24 did not pin a revision; the trainer now requires `--dataset-revision`.                                                                                            |
+| **sort-cubes**     | `Orellius/so101_sort_cubes_no_top` @ `a7c156de…` | 77 eps / 54,777 frames @ 30 fps | Train 0–67, held-out 68–76 (405 anchors, stride 20). Different task and dataset: **not comparable** to cube numbers. Runs before 09-24 did not pin a revision; the trainer now requires `--dataset-revision`. |
 
 Dataset shift inside v1: early vs late episodes differ strongly in joint posture and pace (two recording sessions/operators or a recalibration; the exact cause and changepoint, ~ep 20 vs ~ep 24, are **not established**). Val 32–39 lies entirely in the late regime, so v1 validation measures cross-session generalization.
 
 ## 3. Current best results (single seed, see leaderboard for full list)
 
-| Benchmark                                   | Best VAM                                                                                                         | SmolVLA                                    | Trivial            |
-| :------------------------------------------ | :--------------------------------------------------------------------------------------------------------------- | :----------------------------------------- | :----------------- |
-| v1 Protocol 1.0 (32→8 eps)                  | 13.06 Cosmos-2B video-LoRA T=16 pool2 (~1.2 s); 13.15 T=2 distilled (~204 ms); 14.26 Cosmos 3 Edge base (~92 ms) | 14.83 (1 h)                                | state-repeat 18.86 |
-| Scale-100 Eval-1 / Eval-2 (provisional, §2) | 13.49 / 17.20 Cosmos 3 Edge video-LoRA                                                                           | — (v2 SmolVLA not scored on this protocol) | —                  |
-| sort-cubes held-out 68–76                   | 15.45 Cosmos 3 Edge (BS 8, local artifact); 14.81 BS 64 (**no local artifact; unverified**)                      | 17.27 @50k                                 | —                  |
+| Benchmark                                   | Best VAM / WAM                                                                                                                                    | SmolVLA                                    | Trivial                                      |
+| :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ | :----------------------------------------- | :------------------------------------------- |
+| v1 Protocol 1.0 (32→8 eps)                  | 13.06 Cosmos-2B video-LoRA T=16 pool2 (~1.2 s); 13.48 T=2 distilled re-train (~204 ms); **13.63** Cosmos 3 Edge PEFT LoRA (~80 ms); 15.74 FLUX 3 Action LoRA (~1.0 s) | 14.83 (1 h)                                | command-repeat 18.19; state-repeat 18.86     |
+| Scale-100 Eval-1 / Eval-2 (provisional, §2) | 13.49 / 17.20 Cosmos 3 Edge video-LoRA                                                                                                            | — (v2 SmolVLA not scored on this protocol) | —                                            |
+| sort-cubes held-out 68–76                   | **14.20** FLUX 3 Action LoRA (~1.84 s unmerged / ~1.26 s base); 14.81 Cosmos 3 Edge BS 64; 15.45 BS 8; 15.54 Cosmos 3 Edge PEFT LoRA              | 17.27 @50k                                 | command-repeat 19.69; state-repeat 22.38     |
 
 Caveats that apply to every row: single seed; no confidence interval; 0.1–0.8 differences are likely within noise; full-30 RMSE is dominated by far-horizon error that RTC never executes; the T=2 undistilled and distilled heads were re-trained on 09-09 (13.65 / 13.48 — the gap shrank from 0.59 to 0.16); only the teacher-reference head is still missing.
 
@@ -64,6 +64,21 @@ Still open (not fixed by code changes):
 4. **Breadth before depth.** Six backbones, each with bespoke extractor/LoRA/scripts (≈150 scripts before the 09-24 cleanup). This is where the leak, pseudo-latent and alpha bugs lived.
 5. **Train/eval feature identity not enforced** for online runs (B2, B3).
 6. **Status drift in docs.** Several "no jobs running" / "quarantined" statements stayed live while runs continued. Status now lives only in this file.
+
+## 5b. Key findings from the Sep 25–28 FLUX 3 Action & PEFT sprint
+
+1. **FLUX 3 Action (7B) fits on a single 24 GB 4090 with Qwen3-VL-4B kept on CPU** (`--policy.text_encoder_on_cpu=true`): inference peak **15.8 GiB** (~1.26 s/chunk), LoRA training **20–21 GiB** allocated / ~24.0 GiB reserved (~1.87 s/microstep, 5 h 15 min for 2.5k updates).
+2. **Why raw / zero-shot FLUX 3 Action cannot solve our tasks without fine-tuning:**
+   - `black-forest-labs/flux-3-action-so101` is an embodiment-adapted base checkpoint (trained on `lerobot/community_dataset_v3` with 2 cameras `scene` + `wrist` at 30 Hz), not a zero-shot task policy.
+   - **Calibration mismatch:** its saved processor quantiles assume `shoulder_lift` in `[+84.8°, +184.2°]` and `elbow_flex` in `[+61.4°, +178.9°]`, whereas our SO-101 calibration has `[-97.7°, +79.9°]` and `[-92.5°, +99.8°]`. Running raw with checkpoint quantiles clips states at `-6.0` (**23.71** RMSE on `sort-cubes`).
+   - **Recalibrated zero-shot is just smooth trajectory continuation:** replacing state quantiles with our training-episode quantiles drops zero-shot RMSE to **19.24** on `sort-cubes` (`H1 = 0.51°`) and **30.40** on `cube_out_of_box v1` (`H1 = 0.82°`), which is no better than `command_repeat` (**19.69** and **18.19**). Blanking the missing `scene` camera slot gives **19.33** vs **19.24** when duplicating `wrist` — zero-shot barely uses the scene slot.
+   - **With LoRA (W1 duplicated wrist):** reaches **14.20** on `sort-cubes` (matching the best Cosmos 3 Edge BS 64 at **14.81**) and **15.74** on `cube_out_of_box v1` (where the 10 Hz retiming and tiny 32-episode dataset hurt it; still improving at 2.5k updates).
+3. **Cosmos 3 Edge PEFT migration & task-LoRA ablation:**
+   - Ported `cosmos3_lora.py` and `train_cosmos3_edge_video_lora.py` to 🤗 PEFT (`LoraConfig` + `get_peft_model`), bit-identical to the legacy LoRA when unmerged (`0.0` max diff on the 3.4B model; `7e-6` when merged via `merge_and_unload()`).
+   - On `cube_out_of_box v1`, PEFT video-LoRA + SmolExpert reaches **13.63** (`c3peft_v1_unaug`, vs **13.73** legacy — identical within noise).
+   - On `sort-cubes`, training a task-specific video-LoRA (`lora_cosmos3_edge_sort_cubes_peft`) + SmolExpert gave **15.54** vs **15.45** using the `cube_out_of_box` video-LoRA — **task-specific video-LoRA gave no gain**; the action expert does the task adaptation.
+4. **Offline RMSE across top backbones has converged (~13.1–14.8°):** physical robot trials on `sort-cubes` (where 4 trained checkpoints are ready on `abakus`) are now the only meaningful discriminator.
+5. **Hub note (2026-10-14):** `black-forest-labs/flux-3-action-so101` switched to gated access (`gated: auto`) on Hugging Face at commit `0713a7af`; `abakus` already holds the complete local snapshots (`c9e13b2a` and `62878e29`).
 
 ## 6. Next steps (in order)
 

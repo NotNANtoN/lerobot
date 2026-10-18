@@ -1,6 +1,6 @@
 # Plan: PEFT × LeRobot blog post (with Nemo, HF PEFT)
 
-**Status:** planning, 2026-09-24. No experiments launched yet.
+**Status:** 2026-10-18 — F3A LoRA on a 4090 done on both `sort-cubes` (held-out **14.20**, [plan_flux3_action §7](./plan_flux3_action.md#7-results-2026-09-25)) and `cube_out_of_box v1` (**15.74**); Cosmos 3 Edge video-LoRA ported to PEFT and trained on both datasets (`c3peft_v1_unaug` **13.63** vs legacy **13.73**; `c3peft_sort_cubes` **15.54** vs cross-task LoRA **15.45**). Ready for robot rollout comparison next week.
 **Owner:** Anton. **Co-author:** Nemo (PEFT maintainer).
 **Goal:** a Hugging Face–style blog post showing how to use 🤗 PEFT in LeRobot, with robot-learning examples that go beyond the existing `docs/source/peft_training.mdx` (SmolVLA LoRA on LIBERO).
 
@@ -15,7 +15,7 @@
 - Open 7B world-action model; LeRobot-native (`lerobot.policies.flux3`, extra `flux3`, merged into this fork on 2026-09-25). Hub: `black-forest-labs/flux-3-action-{base,so101,droid}`. BFL thanks HF/LeRobot for "testing PEFT on SO-101" — ask Nemo what already exists.
 - SO-101 recipe: `lerobot-train --config_path=lora.json` (rank/alpha 32, BF16, gradient checkpointing, batch 2 × accum 4, 10k microsteps = 2.5k updates; heads trained fully). ~200 demos per task in their examples.
 - **Contract mismatch for us:** checkpoint expects **two cameras** (`scene` left + `wrist` right, 256×256 each → 512×256 canvas) at **30 Hz**, joint-delta actions + absolute gripper, predict 42 / execute 32. Our sort-cubes data has **only a wrist camera** (no scene camera). Options: (a) record a few episodes with an added scene camera; (b) feed the wrist view as the only camera (duplicate or blank the other half) and LoRA-adapt — degrades the pretrained prior, needs testing; (c) full fine-tune of heads + larger LoRA. (a) is cleanest for a blog post.
-- **4090 feasibility (unverified):** BFL reports ~32 GB for BF16 _inference_ incl. Qwen3-VL-4B text encoder and VAE. Needs cached prompt embedding / text-encoder offload and probably FP8 to fit 24 GB. LoRA training memory not published. This measurement is itself useful blog content.
+- **4090 feasibility (measured 2026-09-25):** fits with Qwen on CPU (`--policy.text_encoder_on_cpu=true`): inference peak 15.8 GiB, LoRA training ~21 GB allocated / 24.0 GB reserved, 1.87 s per batch-2 microstep, 5 h 15 min for BFL's 2.5k-update recipe. No FP8 needed.
 
 ## 2. Candidate storylines (pick one primary)
 
@@ -38,6 +38,8 @@
 6. Results table + one robot clip; practical tips (targets, rank, alpha scaling, merging, saving with `save_pretrained`, loading with `PeftModel.from_pretrained`).
 
 ## 4. Engineering work (in order)
+
+Done 2026-09-25 (items 1–3): `cosmos3_lora.py` gained `cosmos3_lora_config` (PEFT `LoraConfig`, same targets/scaling), `convert_legacy_cosmos3_lora_to_peft`, `load_cosmos3_peft_adapter(merge=…)`; `train_cosmos3_edge_video_lora.py --adapter-format peft` (default) saves `best_adapter/`; the Cosmos 3 feature extractor and `train_smolexpert.py --backbone-lora-weights` accept PEFT adapter dirs. Equivalence on the real 3.4B model (converted v1 adapter, layer 3 outputs, fp32): unmerged max-abs diff **0.0**, merged 7e-6. Unit tests in `tests/policies/test_cosmos3_lora.py`.
 
 1. **PEFT port of the Cosmos 3 Edge video-LoRA** (`train_cosmos3_edge_video_lora.py`): replace `inject_cosmos3_lora` with `peft.LoraConfig(target_modules=…)` + `get_peft_model`; save via `save_pretrained`. Keep the old loader only to read existing adapters (or write a one-off converter to PEFT format).
 2. **PEFT loading in the feature extractor** (`cosmos3_features.py`, `train_smolexpert.py --backbone-lora-weights` → accept a PEFT adapter dir; merge for inference).

@@ -312,16 +312,19 @@ def cosmos3_eval_identity(
     rank = None
     alpha = None
     if lora_checkpoint is not None:
+        from lerobot.policies.vam.cosmos3_lora import (
+            cosmos3_adapter_weights_file,
+            read_cosmos3_adapter_hyperparameters,
+        )
+
         lora_checkpoint = Path(lora_checkpoint).expanduser().resolve()
-        lora_sha = sha256_file(lora_checkpoint)
-        with safe_open(str(lora_checkpoint), framework="pt", device="cpu") as handle:
-            metadata = handle.metadata() or {}
-        # The loader gives safetensors metadata precedence over CLI values. Do not
+        lora_sha = sha256_file(cosmos3_adapter_weights_file(lora_checkpoint))
+        # The loader gives adapter metadata precedence over CLI values. Do not
         # reproduce its silent fallback for malformed metadata in an identity check.
         try:
-            rank = int(metadata.get("rank", lora_rank))
-            alpha = float(metadata.get("alpha", lora_alpha))
-        except (ValueError, TypeError) as exc:
+            recorded = read_cosmos3_adapter_hyperparameters(lora_checkpoint)
+            rank, alpha = recorded if recorded is not None else (int(lora_rank), float(lora_alpha))
+        except (ValueError, TypeError, KeyError) as exc:
             raise ValueError(f"Invalid Cosmos3 LoRA rank/alpha metadata: {lora_checkpoint}") from exc
         if rank <= 0 or not math.isfinite(alpha) or alpha <= 0:
             raise ValueError(f"Invalid Cosmos3 LoRA rank/alpha: {lora_checkpoint}")
@@ -345,10 +348,12 @@ def cosmos3_eval_identity(
 
 def read_adapter_hyperparameters(path: Path) -> tuple[int, float] | None:
     """Return the (rank, alpha) an adapter was trained with, from safetensors metadata or sidecar."""
-    from safetensors import safe_open
 
+    from lerobot.policies.vam.cosmos3_lora import is_peft_adapter, read_cosmos3_adapter_hyperparameters
     from lerobot.policies.vam.cosmos_lora import read_lora_sidecar_hyperparameters
 
+    if is_peft_adapter(path):
+        return read_cosmos3_adapter_hyperparameters(path)
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         meta = handle.metadata() or {}
     for rank_key, alpha_key in (("rank", "alpha"), ("lora_rank", "lora_alpha")):
@@ -367,9 +372,11 @@ def resolve_backbone_lora_hyperparameters(args: argparse.Namespace) -> None:
         args.backbone_lora_rank = args.backbone_lora_rank or 16
         args.backbone_lora_alpha = args.backbone_lora_alpha or 32.0
         return
+    from lerobot.policies.vam.cosmos3_lora import is_peft_adapter
+
     path = Path(args.backbone_lora_weights).expanduser()
-    if not path.is_file():
-        raise FileNotFoundError(f"--backbone-lora-weights not found: {path}")
+    if not (path.is_file() or is_peft_adapter(path)):
+        raise FileNotFoundError(f"--backbone-lora-weights not found (file or PEFT adapter dir): {path}")
     try:
         recorded = read_adapter_hyperparameters(path)
     except Exception as exc:  # noqa: BLE001 - unreadable header: fall back to explicit values
@@ -424,7 +431,11 @@ def validate_online_eval_cache_identity(path: Path, args: argparse.Namespace, *,
         if lora_sha:
             problems.append("cache was built WITH a LoRA but online training uses none")
     else:
-        expected_sha = sha256_file(Path(args.backbone_lora_weights).expanduser())
+        from lerobot.policies.vam.cosmos3_lora import cosmos3_adapter_weights_file
+
+        expected_sha = sha256_file(
+            cosmos3_adapter_weights_file(Path(args.backbone_lora_weights).expanduser())
+        )
         if lora_sha != expected_sha:
             problems.append(f"LoRA sha256 {lora_sha!r} != online adapter {expected_sha!r}")
         if lora is not None:

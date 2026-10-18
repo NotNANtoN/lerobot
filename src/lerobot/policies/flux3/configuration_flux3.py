@@ -87,6 +87,9 @@ class Flux3Config(PreTrainedConfig):
             give a CPU-testable model.
         head_init_seed: Seed of the xavier draw for embodiment heads the trunk does not carry (their final
             layers start at zero, as in the reference). Fixed, so every rank builds identical heads.
+        text_encoder_on_cpu: Keep the frozen Qwen3-VL text encoder on CPU through device moves (about
+            8.3 GiB less GPU memory, e.g. LoRA on 24 GB GPUs). Each new caption is encoded on CPU once,
+            then its embedding is cached on the policy device.
         compile_model: ``torch.compile`` the frozen video VAE, the text encoder and the DiT forward used by
             inference (compiled lazily on the first prediction; one warmup per text-length bucket, none
             with ``text_fixed_length``). Training keeps the eager DiT forward: compilation under
@@ -146,6 +149,7 @@ class Flux3Config(PreTrainedConfig):
     attn_mode: str = "torch"
     dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
     compile_model: bool = False
+    text_encoder_on_cpu: bool = False
 
     # --- sampling ---
     sampler: str = "cosmos_unipc"

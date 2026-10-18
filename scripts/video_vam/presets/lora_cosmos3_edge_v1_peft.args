@@ -1,0 +1,14 @@
+# Cosmos 3 Edge dual-pathway video-LoRA (PEFT) on cube v1 train eps 0-31, val 32-39 (PEFT twin of lora_cosmos3_edge_v1).
+#! trainer: train_cosmos3_edge_video_lora.py
+# Same data, targets, rank/alpha, LR schedule and clip layout as the legacy v1 adapter (best val 0.3791 @ 5000),
+# but 10k steps like the sort-cubes PEFT run. Output: outputs/train/${RUN_TAG}/best_adapter.
+--adapter-format peft
+--train-episodes 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+--val-episodes 32 33 34 35 36 37 38 39
+--pathway dual
+--rank 16
+--alpha 32
+--clip-frames 17
+--max-steps 10000
+--patience 20
+--output-dir outputs/train/${RUN_TAG}

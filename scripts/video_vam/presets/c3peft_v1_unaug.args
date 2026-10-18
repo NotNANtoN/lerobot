@@ -1,0 +1,8 @@
+# SmolExpert on Cosmos 3 Edge features with the cube-v1 PEFT video-LoRA (twin of c3_v1_unaug, 13.73 legacy adapter).
+#! include: _smolexpert_online_base
+#! include: _cube_v1
+--online-backbone cosmos3_edge
+--backbone-checkpoint /home/anton/.cache/video-vam/cosmos3-edge
+--backbone-lora-weights outputs/train/cosmos3-edge-v1-peft-lora/best_adapter
+--backbone-layer 20
+--no-augment

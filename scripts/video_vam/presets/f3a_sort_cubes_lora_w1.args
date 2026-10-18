@@ -1,0 +1,21 @@
+# FLUX 3 Action SO-101 LoRA on sort-cubes (wrist-only, W1 = wrist duplicated into scene+wrist slots).
+#! trainer: lerobot-train
+# Base: BFL flux-3-action-so101 with quantiles recalibrated to sort-cubes train eps 0-67
+# (scripts/video_vam/export_flux3_recalibrated_base.py -> outputs/bases/flux3-so101-sortcubes-recal).
+# Qwen stays on CPU (policy.text_encoder_on_cpu) so DiT + VAE + LoRA fit a 24 GB 4090.
+# Offline eval on held-out eps 68-76: scripts/video_vam/evaluate_flux3_action_rmse.py --policy-path <ckpt>/pretrained_model
+--config_path=examples/flux3/lora.json
+--policy.path=outputs/bases/flux3-so101-sortcubes-recal
+--policy.device=cuda
+--policy.text_encoder_on_cpu=true
+--policy.camera_keys='["observation.images.wrist","observation.images.wrist"]'
+--rename_map='{"observation.images.front":"observation.images.wrist"}'
+--dataset.repo_id=Orellius/so101_sort_cubes_no_top
+--dataset.revision=a7c156de0e84a81e19457e6d783e4316e9f901e1
+--dataset.episodes=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67]
+--dataset.eval_split=0.0
+--dataset.video_backend=torchcodec
+--eval_steps=0
+--wandb.enable=false
+--output_dir=outputs/train/${RUN_TAG}
+--job_name=${RUN_TAG}

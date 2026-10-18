@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import safetensors
 import torch
@@ -12,6 +15,13 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 
 from lerobot.policies.vam.cosmos_lora import LoRALinear, freeze_base_parameters
+from lerobot.utils.import_utils import _peft_available, require_package
+
+if TYPE_CHECKING or _peft_available:
+    from peft import LoraConfig, PeftModel
+
+PEFT_ADAPTER_CONFIG = "adapter_config.json"
+PEFT_ADAPTER_WEIGHTS = "adapter_model.safetensors"
 
 UND_TARGET_MODULES: tuple[str, ...] = (
     "self_attn.to_q",
@@ -149,6 +159,117 @@ def save_cosmos3_lora(
         metadata["target_modules"] = ",".join(target_modules)
 
     save_file(state, str(out_path), metadata=metadata)
+
+
+# ---- PEFT adapters -------------------------------------------------------------------------
+# Same targets, init (A kaiming-uniform, B zero), scaling (alpha / r) and fp32 adapter weights on a
+# bf16 base as LoRALinear, so a legacy adapter converts to PEFT format exactly.
+
+
+def cosmos3_peft_target_regex(
+    target_modules: Sequence[str] = DUAL_PATHWAY_TARGET_MODULES,
+    block_indices: Sequence[int] | None = None,
+) -> str:
+    """PEFT ``target_modules`` regex (full match) selecting ``layers.<i>.<target>`` Linear layers."""
+    blocks = (
+        r"\d+" if block_indices is None else "(?:" + "|".join(str(i) for i in sorted(block_indices)) + ")"
+    )
+    modules = "|".join(re.escape(m) for m in target_modules)
+    return rf"layers\.{blocks}\.(?:{modules})"
+
+
+def cosmos3_lora_config(
+    *,
+    rank: int,
+    alpha: float,
+    target_modules: Sequence[str] = DUAL_PATHWAY_TARGET_MODULES,
+    block_indices: Sequence[int] | None = None,
+) -> LoraConfig:
+    """PEFT LoraConfig equivalent to ``inject_cosmos3_lora(rank, alpha, block_indices, target_modules)``."""
+    require_package("peft", extra="peft")
+    return LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=0.0,
+        bias="none",
+        target_modules=cosmos3_peft_target_regex(target_modules, block_indices),
+        init_lora_weights=True,
+    )
+
+
+def is_peft_adapter(path: str | Path) -> bool:
+    """Whether ``path`` is a PEFT adapter directory (``adapter_config.json`` + weights)."""
+    return Path(path).is_dir() and (Path(path) / PEFT_ADAPTER_CONFIG).is_file()
+
+
+def cosmos3_adapter_weights_file(path: str | Path) -> Path:
+    """The tensor file of a legacy adapter (the file itself) or a PEFT adapter directory."""
+    path = Path(path)
+    return path / PEFT_ADAPTER_WEIGHTS if is_peft_adapter(path) else path
+
+
+def read_cosmos3_adapter_hyperparameters(path: str | Path) -> tuple[int, float] | None:
+    """``(rank, alpha)`` recorded by the adapter itself (PEFT config or legacy safetensors metadata)."""
+    path = Path(path)
+    if is_peft_adapter(path):
+        config = json.loads((path / PEFT_ADAPTER_CONFIG).read_text())
+        return int(config["r"]), float(config["lora_alpha"])
+    with safetensors.safe_open(str(path), framework="pt") as f:
+        meta = f.metadata() or {}
+    if "rank" in meta and "alpha" in meta:
+        return int(meta["rank"]), float(meta["alpha"])
+    return None
+
+
+def load_cosmos3_peft_adapter(transformer: nn.Module, path: str | Path, *, merge: bool) -> nn.Module:
+    """Attach a PEFT adapter to a Cosmos 3 transformer for frozen inference.
+
+    ``merge=True`` folds ``W + (alpha / r) B A`` into the base weights (plain ``nn.Linear``, no
+    adapter overhead, compile-friendly; the update is rounded to the base dtype). ``merge=False``
+    keeps the fp32 adapter branch, numerically matching the legacy ``LoRALinear`` path.
+    Returns the (unwrapped) transformer with every parameter frozen.
+    """
+    require_package("peft", extra="peft")
+    if not is_peft_adapter(path):
+        raise FileNotFoundError(f"Not a PEFT adapter directory: {path}")
+    peft_model = PeftModel.from_pretrained(transformer, str(path), is_trainable=False)
+    model = peft_model.merge_and_unload() if merge else peft_model.get_base_model()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+def convert_legacy_cosmos3_lora_to_peft(
+    legacy_file: str | Path, output_dir: str | Path, *, base_model_name_or_path: str | None = None
+) -> Path:
+    """Rewrite a ``save_cosmos3_lora`` file as a PEFT adapter directory (tensors unchanged)."""
+    legacy_file, output_dir = Path(legacy_file), Path(output_dir)
+    if output_dir.exists():
+        raise FileExistsError(output_dir)
+    recorded = read_cosmos3_adapter_hyperparameters(legacy_file)
+    if recorded is None:
+        raise ValueError(f"{legacy_file} has no rank/alpha metadata; refusing to guess the scaling")
+    rank, alpha = recorded
+    state = load_file(str(legacy_file))
+    blocks, modules = set(), set()
+    for key in state:
+        parts = key.split(".")
+        if parts[0] != "layers" or not parts[1].isdigit() or parts[-1] not in ("lora_A", "lora_B"):
+            raise ValueError(f"Unexpected legacy LoRA key: {key}")
+        blocks.add(int(parts[1]))
+        modules.add(".".join(parts[2:-1]))
+    config = cosmos3_lora_config(
+        rank=rank, alpha=alpha, target_modules=sorted(modules), block_indices=sorted(blocks)
+    )
+    config.base_model_name_or_path = base_model_name_or_path
+    output_dir.mkdir(parents=True)
+    config.save_pretrained(str(output_dir))
+    save_file(
+        {f"base_model.model.{key}.weight": value.contiguous() for key, value in state.items()},
+        str(output_dir / PEFT_ADAPTER_WEIGHTS),
+        metadata={"format": "pt"},
+    )
+    return output_dir
 
 
 def load_cosmos3_lora(
