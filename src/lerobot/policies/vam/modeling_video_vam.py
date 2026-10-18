@@ -89,6 +89,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
         self.rtc_processor: RTCProcessor | None = None
         self._closed = False
         self._ltx_context_transform: str | None = None
+        self.jepa_world_model: Any | None = None
 
         injected = (decoder is not None, extractor is not None, prompt_embedding is not None)
         if any(injected) and not all(injected):
@@ -135,6 +136,14 @@ class VideoVAMPolicy(PreTrainedPolicy):
         if should_compile and str(config.device).startswith("cuda") and hasattr(torch, "compile"):
             self.decoder._vector_field = torch.compile(self.decoder._vector_field, mode="max-autotune")
         self.extractor, self.prompt_embedding = self._build_extractor()
+        if config.jepa_world_model_checkpoint is not None and config.jepa_planning_mode != "none":
+            from safetensors.torch import load_file
+
+            from .jepa_world_model import ControlAwareJEPAWorldModel, JEPAWorldModelConfig
+
+            wm = ControlAwareJEPAWorldModel(JEPAWorldModelConfig(vis_dim=input_channels)).to(config.device)
+            wm.load_state_dict(load_file(str(config.jepa_world_model_checkpoint), device=str(config.device)))
+            self.jepa_world_model = wm.eval()
 
     @classmethod
     def from_pretrained(
@@ -423,16 +432,53 @@ class VideoVAMPolicy(PreTrainedPolicy):
             if rtc_config is None:
                 raise ValueError("prev_chunk_left_over requires config.rtc_config")
             execution_horizon = rtc_config.execution_horizon
-        actions = self.decoder.sample_actions(
-            state.to(device=self.config.device, dtype=torch.float32),
-            context,
-            seed=self.config.action_seed if action_seed is None else action_seed,
-            noise=noise,
-            rtc_processor=rtc,
-            inference_delay=inference_delay,
-            prev_chunk_left_over=prev_chunk_left_over,
-            execution_horizon=execution_horizon,
-        )
+        state_dev = state.to(device=self.config.device, dtype=torch.float32)
+        base_seed = self.config.action_seed if action_seed is None else action_seed
+        if self.jepa_world_model is not None and self.config.jepa_planning_mode != "none" and noise is None:
+            n_cand = max(2, int(self.config.jepa_num_candidates))
+            noises = []
+            base_n: Tensor | None = None
+            for k in range(n_cand):
+                gen = torch.Generator(device=self.config.device).manual_seed(base_seed + k * 997)
+                n_k = torch.randn((1, 30, 32), generator=gen, device=self.config.device, dtype=torch.float32)
+                if base_n is not None:
+                    n_k = 0.85 * base_n + 0.35 * n_k
+                else:
+                    base_n = n_k.clone()
+                noises.append(n_k[0])
+            noise_batch = torch.stack(noises, dim=0)
+            cands_raw = self.decoder.sample_actions(
+                state_dev.expand(n_cand, -1),
+                context.float().expand(n_cand, -1, -1),
+                noise=noise_batch,
+                rtc_processor=rtc,
+                inference_delay=inference_delay,
+                prev_chunk_left_over=prev_chunk_left_over,
+                execution_horizon=execution_horizon,
+                use_cuda_graph=False,
+            )
+            norm = self.decoder.normalizer
+            s_norm = norm.normalize_state(state_dev)
+            cands_norm = norm.normalize_action(cands_raw)
+            h_t = self.jepa_world_model.encode(context, s_norm, use_target=False)
+            if self.config.jepa_planning_mode == "mppi":
+                chosen_norm, _ = self.jepa_world_model.plan_mppi(h_t, s_norm, cands_norm)
+                actions = norm.denormalize_action(chosen_norm).unsqueeze(0)
+            else:
+                scored = self.jepa_world_model.score_action_candidates(h_t, s_norm, cands_norm)
+                best_idx = int(scored["score"].argmax().item())
+                actions = cands_raw[best_idx : best_idx + 1]
+        else:
+            actions = self.decoder.sample_actions(
+                state_dev,
+                context,
+                seed=base_seed,
+                noise=noise,
+                rtc_processor=rtc,
+                inference_delay=inference_delay,
+                prev_chunk_left_over=prev_chunk_left_over,
+                execution_horizon=execution_horizon,
+            )
         return self._apply_action_safety(actions)
 
     @torch.no_grad()

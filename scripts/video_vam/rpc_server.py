@@ -113,6 +113,8 @@ def checkpoint_identity(args: argparse.Namespace) -> dict[str, Any]:
             "max_guidance_weight": args.max_guidance_weight,
             "joint_limits_min": args.joint_limits_min,
             "joint_limits_max": args.joint_limits_max,
+            "jepa_planning_mode": getattr(args, "jepa_planning_mode", "none"),
+            "jepa_num_candidates": getattr(args, "jepa_num_candidates", 8),
         },
     }
 
@@ -169,6 +171,10 @@ class RPCApplication:
             config.device = str(self.device)
             config.cosmos_torch_compile = args.compile
             config.action_euler_steps = getattr(args, "euler_steps", None)
+            if getattr(args, "jepa_world_model", None) is not None:
+                config.jepa_world_model_checkpoint = args.jepa_world_model
+                config.jepa_planning_mode = args.jepa_planning_mode
+                config.jepa_num_candidates = args.jepa_num_candidates
             if args.compile:
                 config.cosmos_compile_friendly = True
             if args.joint_limits_min is not None:
@@ -396,6 +402,24 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Video-VAM action flow Euler steps (default: checkpoint value, 10). E.g. 3 for lower latency.",
+    )
+    parser.add_argument(
+        "--jepa-world-model",
+        type=Path,
+        default=None,
+        help="Optional ControlAwareJEPAWorldModel .safetensors checkpoint for MuZero latent search.",
+    )
+    parser.add_argument(
+        "--jepa-planning-mode",
+        choices=("none", "best_of_n", "mppi"),
+        default="none",
+        help="Latent world-model search mode when --jepa-world-model is set.",
+    )
+    parser.add_argument(
+        "--jepa-num-candidates",
+        type=int,
+        default=8,
+        help="Number of SmolExpert candidate chunks sampled per control step for JEPA search.",
     )
     args = parser.parse_args(argv)
     if args.euler_steps is not None and args.euler_steps < 1:

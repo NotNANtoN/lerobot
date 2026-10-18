@@ -98,6 +98,9 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos_lora_weights: Path | None = None
     cosmos3_checkpoint: Path = Path("/home/anton/.cache/video-vam/cosmos3-edge")
     cosmos3_lora_weights: Path | None = None
+    jepa_world_model_checkpoint: Path | None = None
+    jepa_planning_mode: str = "none"
+    jepa_num_candidates: int = 8
 
     ltx_transformer: Path = DEFAULT_LTX_TRANSFORMER
     ltx_vae: Path = DEFAULT_LTX_VAE
@@ -129,6 +132,12 @@ class VideoVAMConfig(PreTrainedConfig):
             self.cosmos3_checkpoint = Path(self.cosmos3_checkpoint)
         if self.cosmos3_lora_weights is not None:
             self.cosmos3_lora_weights = Path(self.cosmos3_lora_weights)
+        if self.jepa_world_model_checkpoint is not None:
+            self.jepa_world_model_checkpoint = Path(self.jepa_world_model_checkpoint)
+        if self.jepa_planning_mode not in {"none", "best_of_n", "mppi"}:
+            raise ValueError("jepa_planning_mode must be 'none', 'best_of_n', or 'mppi'")
+        if self.jepa_num_candidates < 1:
+            raise ValueError("jepa_num_candidates must be >= 1")
         if self.backend not in {"cosmos", "cosmos3_edge", "ltx"}:
             raise ValueError("backend must be 'cosmos' or 'ltx'")
         if self.cosmos_state_t not in (2, 16):
