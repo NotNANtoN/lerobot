@@ -55,7 +55,7 @@ Done 2026-09-25 (items 1–3): `cosmos3_lora.py` gained `cosmos3_lora_config` (P
 | P1  | SmolVLA sort-cubes: frozen-VLM expert-only (baseline recipe) vs `--peft` LoRA on expert (r 16/64) vs full fine-tune | params, peak mem, wall-clock, held-out RMSE (68–76), robot success | Section 2    |
 | P2  | Cosmos 3 Edge video-LoRA with PEFT on sort-cubes videos                                                             | video val loss; equivalence to old adapter                         | Sections 3–4 |
 | P3  | SmolExpert on PEFT-adapted Cosmos 3 Edge features vs base features (sort-cubes)                                     | held-out RMSE, robot success                                       | Section 4    |
-| P4  | Latency: adapter-attached vs merged, eager vs compiled                                                              | ms / chunk on 4090                                                 | Section 4    |
+| P4  | Latency: adapter-attached vs merged, eager vs compiled                                                              | **Done (F3A on 4090):** unmerged 1,841 ms → `merge_and_unload()` **1,250 ms** (−32 %, no RMSE loss); split CFG 4/1 slightly improves RMSE; CFG 1/1 (single pass) drops to **655 ms** (RTF 0.61) at +0.55° RMSE | Section 4    |
 | P5  | (optional) distillation LoRA                                                                                        | see distillation plan                                              | Section 5    |
 
 Use **sort-cubes** as the demo task: it has a policy that works on the robot and a held-out split (68–76). All runs: 3 seeds for the headline comparison, pinned dataset revision.

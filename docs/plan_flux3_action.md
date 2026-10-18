@@ -118,8 +118,17 @@ Preset `f3a_sort_cubes_lora_w1` = BFL `lora.json` unchanged (r/alpha 32, BF16, g
 
 - Better than every previous sort-cubes number on Full-30 (Cosmos 3 Edge BS 64: 14.81, BS 8: 15.45, SmolVLA ~17.3), with **wrist-only input, BFL's recipe unchanged and 5 h on one 4090**. Caveat: single seed; differences < ~0.5 are within noise (see status pitfalls), so "on par with the best Cosmos run" is the honest reading, H1/F5 are not comparable (F3A sees the command history).
 - Plateau after ~1.2k updates; EMA helps slightly at the end (14.54 vs 14.73).
-- Inference with the **unmerged** adapter: 1.84 s / chunk (vs 1.26 s base) → merge the adapter for deployment (P4 in the PEFT plan).
-- Next: robot trial (synchronous `lerobot-rollout`, recalibrated base + adapter, wrist key mapped to both slots), W3 single-camera layout, seed repeat.
+- Inference with the **unmerged** adapter: 1.84 s / chunk (vs 1.26 s base).
+- **Adapter merging (`merge_and_unload()`) & guidance/step trade-off on the 4090 (measured on 17 held-out anchors across all 9 eval episodes, `007500_model_ema`):**
+
+| Serving setting | Median latency / chunk | RTF (vs 1.07 s executed) | Subset Full-30 RMSE | Notes |
+| :-- | --: | --: | --: | :-- |
+| Unmerged PEFT adapter, CFG 3/3, 4 steps | 1,841 ms | 1.72 | 15.95 | fp32 LoRA branch runs alongside bf16 Linear |
+| **Merged (`merge_and_unload()`), CFG 3/3, 4 steps** | **1,250 ms** | 1.17 | **15.73** | **32 % faster**, back to base speed, no accuracy loss |
+| Merged, **split CFG 4/1** (video 4, action 1), 4 steps | 1,258 ms | 1.18 | **15.65** | BFL's production guidance setting |
+| **Merged, no CFG (1/1, single pass/step), 4 steps** | **655 ms** | **0.61** | 16.28 | **Nearly 2× faster than real time** on a 4090 (+0.55° RMSE) |
+
+- Next: robot trial (synchronous `lerobot-rollout`, recalibrated base + merged adapter, try both CFG 4/1 at 1.25 s and CFG 1/1 at 0.65 s), W3 single-camera layout, seed repeat.
 
 ### F2b — cube-out-of-box v1 (10 Hz), Protocol 1.0 (2026-09-26)
 
