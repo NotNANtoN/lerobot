@@ -1,0 +1,11 @@
+# Control-Aware JEPA Latent World Model + MuZero/MPPI Planner on cube_out_of_box v1 (Cosmos 3 Edge features).
+#! trainer: train_jepa_world_model.py
+--train-manifest outputs/features/cosmos3-edge-lora/train/manifest.json
+--val-manifest outputs/features/cosmos3-edge-lora/val/manifest.json
+--policy-run-dir outputs/train/v1-cosmos3-edge-lora-online-unaugmented-smolexpert
+--idm-weight 1.0
+--epochs 40
+--batch-size 64
+--lr 3e-4
+--num-candidates 16
+--output-dir outputs/train/${RUN_TAG}

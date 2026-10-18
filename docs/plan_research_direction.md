@@ -80,6 +80,33 @@ Sources: Dong & Finn blog "Towards Universal Post-Training for Robotics" (Sep 20
 
 Caveat: purely offline with no new rollouts is capped — failure modes never seen cannot be fixed. Stages 1–2 need rollouts only as data collection with a safe policy.
 
+## 3c. Control-Aware JEPA Latent World Model & MuZero/MPPI Search (Implemented 2026-10-18)
+
+Sources (LeCun et al., Aug–Oct 2026):
+- **Toso, LeCun, Anderson, Bounou (Oct 6, 2026, [arXiv:2610.07540](https://arxiv.org/abs/2610.07540)):** *"Preserving Unstable Modes Through Inverse Dynamics in JEPA World Models"* — proves that standard JEPA next-step prediction + anti-collapse regularization still collapses controllable unstable modes; adding an **inverse dynamics (action reconstruction) objective** $I_\psi(h_t, h_{t+H}) \to \hat{a}_{t:t+H}$ makes the encoder injective on the finite-horizon reachable subspace.
+- **Zhang, Terver, Rabbat, LeCun, Balestriero (Oct 5, 2026, [arXiv:2610.06805](https://arxiv.org/abs/2610.06805)):** *"H-JEPA: End-to-End Learning of Hierarchical World Models for Visual Planning"* — chunk-horizon latent prediction with inverse-dynamics supervision for visual planning on real-robot videos (DROID).
+- **Yalovetzky, Balestriero, LeCun (Oct 11, 2026, [arXiv:2610.15267](https://arxiv.org/abs/2610.15267)):** *"LeHami: Symplectic Latent Dynamics for World Models"* — explicit position + velocity/temporal-difference latent state to prevent rollout contraction.
+- **Kuhn, Maes, Serra, Le Lidec, LeCun (Aug 27, 2026, [arXiv:2608.27395](https://arxiv.org/abs/2608.27395)):** *"LeVJEPA"* — variance-covariance regularization (`SIGReg`/`VICReg`).
+
+### Architecture (`src/lerobot/policies/vam/jepa_world_model.py`, `scripts/video_vam/train_jepa_world_model.py`)
+Built on top of our frozen Cosmos 3 Edge 600-token visual latents ($2\times 15\times 20 \times 2048$) + 6-DoF proprioceptive state:
+1. **Motion-Aware Spatial-Temporal Pooler $E_\theta(z_t, s_t) \to h_t \in \mathbb{R}^{512}$** (with EMA target encoder $E_{\bar{\theta}}$ and VICReg variance-covariance anti-collapse loss; explicitly encodes both current frame $t_1$ and temporal difference $t_1 - t_0$).
+2. **Variable-Horizon Forward Predictor $P_\phi(h_t, s_t, a_{t:t+H}, H) \to (\hat{h}_{t+H}, \hat{s}_{t+H})$** trained across multi-horizon transitions $H \in \{3, 6, 9, 12, 15, 18, 21, 24, 30\}$ (12,676 transitions on `cube_out_of_box v1`).
+3. **Inverse Dynamics Head $I_\psi(h_t, h_{t+H}, H) \to \hat{a}_{t:t+H}$** (LeCun Oct 2026 `2610.07540`), which also provides a **forward–inverse cycle consistency score** $-\|I_\psi(h_t, P_\phi(h_t, a)) - a\|^2$ during planning to penalize out-of-distribution world-model hallucinations.
+4. **MuZero Value / Progress & Goal Head $V_\omega(h_t) \to (\hat{v}_t \in [0, 1], \hat{g}_t)$** trained with temporal ranking margin + goal prototype.
+5. **MuZero / MPPI Latent Search (`score_action_candidates`, `plan_mppi`):** samples $N=16$ candidate action chunks in one batched pass from the trained `SmolExpert` flow-matching policy prior and scores/refines them across lookahead horizons $H \in \{10, 20, 30\}$ in **< 4 ms** of world-model compute (**184 ms** total including batched 16-sample flow-matching).
+
+### Results on `cube_out_of_box v1` held-out episodes 32–39 ($H=20$ = 2.0 s lookahead, 40 epochs = ~25 s training)
+
+| Metric on unseen validation episodes (32–39) | Standard JEPA (`--idm-weight 0.0`) | **Control-Aware JEPA (`--idm-weight 1.0`, `arXiv:2610.07540`)** | Trivial / No-Action Baseline |
+| :--- | ---: | ---: | ---: |
+| **Top-1 Future Latent Retrieval (out of 80 @ Epoch 40)** | 50.0 % (collapses from 80 %) | **72.5 %** (peak **87.5 %**, Top-5 **96.3 %**) | 1.25 % (identity) |
+| **Forward Latent Cosine Similarity ($\hat{h}_{t+20}$ vs $h_{t+20}$)** | 0.780 (+0.171 vs ID) | **0.852** (+0.231 vs ID, peak **0.945**) | 0.621 (identity) / 0.643 (zero-action) |
+| **2.0 s Future Joint-State RMSE (degrees)** | 5.27° | **4.73°** | 21.29° (state-repeat) / 26.91° (zero-action) |
+| **Inverse Dynamics Action RMSE (degrees)** | 33.11° (untrained) | **7.80°–8.14°** | — |
+| **Value / Progress Spearman $\rho$ on unseen episodes** | 0.899 | **0.882–0.890** | 0.000 |
+| **MuZero Best-of-16 on SmolExpert (H1 / F5 / Full-30)** | 4.25° / 5.95° / 13.64° *(hurts H1)* | **4.16° / 5.90° / 13.63°** *(improves H1 & F5 vs 4.22° / 5.95° / 13.64° single-sample)* | — |
+
 ## 4. On "offline RMSE vs robot success"
 
 Anton's position: if a policy cannot predict the demonstrated actions it is probably not good, so offline RMSE is a (correlated) indicator even if the robot is the real test. Agreed, with a nuance worth measuring rather than assuming: the correlation seems weak across _tasks_ (sort-cubes held-out SmolVLA ~17 works on the robot, cube v1 ~14.8 does not) and unknown _within_ a task. Plan: for sort-cubes, collect both offline RMSE (held-out 68–76, H1/F5/full-30) and robot success for every policy tested (old Orellius policy, retrained SmolVLA, Cosmos 3 Edge BS 8 / BS 64). That is R2's first data and immediately useful.
