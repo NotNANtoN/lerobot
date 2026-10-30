@@ -773,18 +773,246 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
                 local_idx = self.ep_starts[ep] + f
                 self.index_map.append((ep, f, local_idx))
 
+        self._ram_preloaded = False
+        self._tabular_preloaded = False
+        self._ram_ep_frames: dict[int, Tensor] = {}
+        self._ram_states: list[Tensor] = []
+        self._ram_actions: list[Tensor] = []
+        self._ram_paddings: list[Tensor] = []
+        self._ep_video_info: dict[int, tuple[Path, float, list[float]]] = {}
+        self._cam_delta_indices: list[int] = [-4, -3, -2, -1, 0]
+        self._maybe_preload_to_ram()
+
+    @staticmethod
+    def _get_available_ram_bytes() -> int:
+        avail_bytes = 0
+        meminfo = Path("/proc/meminfo")
+        if meminfo.is_file():
+            for line in meminfo.read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    avail_bytes = int(line.split()[1]) * 1024
+                    break
+        elif (
+            hasattr(os, "sysconf")
+            and "SC_PAGE_SIZE" in os.sysconf_names
+            and "SC_AVPHYS_PAGES" in os.sysconf_names
+        ):
+            avail_bytes = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_AVPHYS_PAGES"))
+
+        for cg_lim_p, cg_stat_p, cg_cur_p in (
+            (
+                Path("/sys/fs/cgroup/memory.max"),
+                Path("/sys/fs/cgroup/memory.stat"),
+                Path("/sys/fs/cgroup/memory.current"),
+            ),
+            (
+                Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+                Path("/sys/fs/cgroup/memory/memory.stat"),
+                Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+            ),
+        ):
+            if cg_lim_p.is_file():
+                raw = cg_lim_p.read_text().strip()
+                if raw.isdigit():
+                    cg_lim = int(raw)
+                    if 0 < cg_lim < (1 << 50):
+                        used_rss = 0
+                        if cg_stat_p.is_file():
+                            for sline in cg_stat_p.read_text().splitlines():
+                                if sline.startswith("total_rss ") or sline.startswith("anon "):
+                                    used_rss = max(used_rss, int(sline.split()[1]))
+                        if used_rss == 0 and cg_cur_p.is_file():
+                            cur_raw = cg_cur_p.read_text().strip()
+                            if cur_raw.isdigit():
+                                used_rss = int(cur_raw)
+                        cg_avail = max(0, cg_lim - used_rss)
+                        avail_bytes = min(avail_bytes, cg_avail) if avail_bytes > 0 else cg_avail
+        return avail_bytes
+
+    def _maybe_preload_to_ram(self) -> None:
+        from collections import defaultdict
+        from concurrent.futures import ThreadPoolExecutor
+
+        from lerobot.datasets.utils import shift_timestamps
+        from lerobot.datasets.video_utils import decode_video_frames
+
+        t0 = time.perf_counter()
+        reader = self.lerobot_ds._ensure_reader()
+        hf_ds = reader.hf_dataset if reader.hf_dataset is not None else reader.load_and_activate()
+        vid_key = self.contract.camera_key
+        if reader.delta_indices is not None and vid_key in reader.delta_indices:
+            self._cam_delta_indices = list(reader.delta_indices[vid_key])
+
+        rel_indices = [local_idx for _, _, local_idx in self.index_map]
+        base = hf_ds[rel_indices]
+        ep_idxs = [int(base["episode_index"][i]) for i in range(len(rel_indices))]
+        abs_idxs = [int(base["index"][i]) for i in range(len(rel_indices))]
+        query_indices_per_item = []
+        paddings_per_item = []
+        for abs_i, ep_i in zip(abs_idxs, ep_idxs, strict=True):
+            q_idx, pad = reader._get_query_indices(abs_i, ep_i)
+            query_indices_per_item.append(q_idx)
+            paddings_per_item.append(pad)
+        tabular_list = reader._query_hf_dataset(query_indices_per_item)
+        for tab, pad in zip(tabular_list, paddings_per_item, strict=True):
+            self._ram_states.append(tab[self.contract.state_key].squeeze(0).contiguous())
+            self._ram_actions.append(tab[self.contract.action_key].contiguous())
+            self._ram_paddings.append(pad[f"{self.contract.action_key}_is_pad"].contiguous())
+
+        ts_col_all = reader._column_view("timestamp")[list(range(len(hf_ds)))]["timestamp"]
+        for ep in self.episodes:
+            ep_meta = reader._meta.episodes[ep]
+            ep_len = int(ep_meta["length"])
+            start_rel = self.ep_starts[ep]
+            query_ts = [float(t) for t in ts_col_all[start_rel : start_rel + ep_len]]
+            from_ts = float(ep_meta[f"videos/{vid_key}/from_timestamp"])
+            video_path = reader.root / reader._meta.get_video_file_path(ep, vid_key)
+            self._ep_video_info[ep] = (video_path, from_ts, query_ts)
+        self._tabular_preloaded = True
+
+        total_frames = sum(int(self.lerobot_ds.meta.episodes[ep]["length"]) for ep in self.episodes)
+        cam_h, cam_w, cam_c = getattr(self.contract, "camera_shape", (480, 640, 3))
+        frame_bytes = cam_h * cam_w * cam_c
+        required_bytes = total_frames * frame_bytes
+        avail_ram_bytes = self._get_available_ram_bytes()
+        ram_headroom_bytes = 26 * (1024**3)
+        usable_ram_bytes = max(0, avail_ram_bytes - ram_headroom_bytes)
+
+        usable_vram_bytes = 0
+        if torch.cuda.is_available():
+            try:
+                free_vram, _ = torch.cuda.mem_get_info()
+                vram_headroom_bytes = 24 * (1024**3)
+                usable_vram_bytes = max(0, int(free_vram) - vram_headroom_bytes)
+            except Exception:
+                usable_vram_bytes = 0
+
+        req_gb = required_bytes / (1024**3)
+        avail_gb = avail_ram_bytes / (1024**3)
+        usable_total_gb = (usable_ram_bytes + usable_vram_bytes) / (1024**3)
+        print(
+            f"[OnlineVideoDataset] Memory check for {len(self.episodes)} episodes ({total_frames} frames): "
+            f"requires {req_gb:.2f} GB, free RAM {avail_gb:.2f} GB, usable RAM+VRAM budget {usable_total_gb:.2f} GB.",
+            flush=True,
+        )
+        if usable_ram_bytes + usable_vram_bytes < frame_bytes * 500:
+            print("[OnlineVideoDataset] Insufficient RAM headroom; streaming videos from disk.", flush=True)
+            return
+
+        selected_eps: dict[int, str] = {}
+        rem_ram = usable_ram_bytes
+        rem_vram = usable_vram_bytes
+        preload_frames_count = 0
+        for ep in self.episodes:
+            ep_len = int(reader._meta.episodes[ep]["length"])
+            ep_b = ep_len * frame_bytes
+            if ep_b <= rem_ram:
+                selected_eps[ep] = "cpu"
+                rem_ram -= ep_b
+                preload_frames_count += ep_len
+            elif ep_b <= rem_vram:
+                selected_eps[ep] = "cuda"
+                rem_vram -= ep_b
+                preload_frames_count += ep_len
+
+        if not selected_eps:
+            return
+
+        file_groups: dict[Path, list[tuple[int, int, list[float]]]] = defaultdict(list)
+        for ep in selected_eps:
+            video_path, from_ts, query_ts = self._ep_video_info[ep]
+            shifted_ts = shift_timestamps(query_ts, from_ts)
+            file_groups[video_path].append((ep, len(query_ts), shifted_ts))
+
+        chunk_ep_count = 6
+        for v_path, ep_entries in file_groups.items():
+            ep_entries_sorted = sorted(ep_entries, key=lambda x: x[2][0] if x[2] else 0.0)
+            for start_i in range(0, len(ep_entries_sorted), chunk_ep_count):
+                sub_entries = ep_entries_sorted[start_i : start_i + chunk_ep_count]
+                combined_ts: list[float] = []
+                for _, _, s_ts in sub_entries:
+                    combined_ts.extend(s_ts)
+                all_frames = decode_video_frames(
+                    v_path,
+                    combined_ts,
+                    reader._tolerance_s,
+                    reader._video_backend,
+                    return_uint8=True,
+                ).squeeze(0)
+                offset = 0
+                for ep_id, ep_len, _ in sub_entries:
+                    target_dev = selected_eps[ep_id]
+                    ep_slice = all_frames[offset : offset + ep_len]
+                    self._ram_ep_frames[ep_id] = (
+                        ep_slice.to(device="cuda", non_blocking=True)
+                        if target_dev == "cuda"
+                        else ep_slice.clone()
+                    )
+                    offset += ep_len
+                del all_frames
+
+        self._ram_preloaded = len(self._ram_ep_frames) == len(self.episodes)
+        elapsed = time.perf_counter() - t0
+        cpu_eps = sum(1 for d in selected_eps.values() if d == "cpu")
+        gpu_eps = sum(1 for d in selected_eps.values() if d == "cuda")
+        print(
+            f"[OnlineVideoDataset] Preloaded {len(selected_eps)}/{len(self.episodes)} episodes "
+            f"(CPU: {cpu_eps}, VRAM: {gpu_eps}, {preload_frames_count} frames) in {elapsed:.1f}s.",
+            flush=True,
+        )
+
     def __len__(self) -> int:
         return len(self.index_map)
 
     def __getitem__(self, idx: int) -> OnlineVideoItem:
         ep, frame, local_idx = self.index_map[idx]
-        sample = self.lerobot_ds[local_idx]
+        sample_id = f"episode-{ep:04d}-frame-{frame:06d}"
+        if ep in self._ram_ep_frames and self._tabular_preloaded:
+            ep_frames = self._ram_ep_frames[ep]
+            ep_len = ep_frames.shape[0]
+            win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
+            camera = ep_frames[win]
+            return OnlineVideoItem(
+                rgb=camera,
+                state=self._ram_states[idx],
+                action=self._ram_actions[idx],
+                action_is_pad=self._ram_paddings[idx],
+                sample_id=sample_id,
+                episode_index=ep,
+                frame_index=frame,
+            )
 
+        if self._tabular_preloaded and ep in self._ep_video_info:
+            from lerobot.datasets.utils import shift_timestamps
+            from lerobot.datasets.video_utils import decode_video_frames
+
+            video_path, from_ts, ep_ts = self._ep_video_info[ep]
+            ep_len = len(ep_ts)
+            win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
+            win_ts = shift_timestamps([ep_ts[w] for w in win], from_ts)
+            reader = self.lerobot_ds._ensure_reader()
+            camera = decode_video_frames(
+                video_path,
+                win_ts,
+                reader._tolerance_s,
+                reader._video_backend,
+                return_uint8=True,
+            ).squeeze(0)
+            return OnlineVideoItem(
+                rgb=camera,
+                state=self._ram_states[idx],
+                action=self._ram_actions[idx],
+                action_is_pad=self._ram_paddings[idx],
+                sample_id=sample_id,
+                episode_index=ep,
+                frame_index=frame,
+            )
+
+        sample = self.lerobot_ds[local_idx]
         camera = sample[self.contract.camera_key]
         state = sample[self.contract.state_key].squeeze(0).contiguous()
         action = sample[self.contract.action_key].contiguous()
         action_is_pad = sample[f"{self.contract.action_key}_is_pad"].contiguous()
-        sample_id = f"episode-{ep:04d}-frame-{frame:06d}"
 
         return OnlineVideoItem(
             rgb=camera,
@@ -1123,7 +1351,9 @@ def evaluate_validation(
                 if all(item.sample_id in val_cache for item in batch_items):
                     contexts = torch.stack([val_cache[item.sample_id] for item in batch_items]).to(device=device)
                 else:
-                    raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
+                    raw_rgb = torch.stack(
+                        [item.rgb.to(device=device, non_blocking=True) for item in batch_items]
+                    )
                     rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
                     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                         if hasattr(extractor, "encode_latents") and hasattr(
@@ -2858,7 +3088,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 7. Training Loop with Exact Gradient Accumulation
     if args.compile_loss and device.type == "cuda" and not args.dry_run:
-        compile_mode = "reduce-overhead" if args.grad_accum_steps == 1 else "default"
+        compile_mode = "default"
         print(f"Compiling flow_matching_loss with mode='{compile_mode}'...", flush=True)
         flow_matching_loss_fn = torch.compile(decoder.flow_matching_loss, mode=compile_mode)
     else:
@@ -2893,14 +3123,15 @@ def main(argv: list[str] | None = None) -> int:
                 data_idx = 0
         return out_idxs
 
-    prefetch_pool = ThreadPoolExecutor(max_workers=8) if (is_online and not args.dry_run) else None
+    prefetch_pool = ThreadPoolExecutor(max_workers=1) if (is_online and not args.dry_run) else None
     prefetch_queue: list[Future[list[Any]]] = []
     if prefetch_pool is not None:
-        for _ in range(4):
+        for _ in range(2):
             prefetch_queue.append(prefetch_pool.submit(_fetch_batch, _next_batch_indices()))
 
     if is_online and not args.dry_run and backbone_extractor is not None and not hasattr(backbone_extractor, "_online_ram_cache"):
         backbone_extractor._online_ram_cache = {}
+        backbone_extractor._ram_cache_full = False
 
     while opt_step < args.max_steps:
         optimizer.zero_grad()
@@ -2928,7 +3159,9 @@ def main(argv: list[str] | None = None) -> int:
                             device=device
                         )
                     else:
-                        raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
+                        raw_rgb = torch.stack(
+                            [item.rgb.to(device=device, non_blocking=True) for item in batch_items]
+                        )
                         if args.augment:
                             if getattr(args, "aug_strategy", "physics") == "physics":
                                 rgb_in = physics_augment_temporal_window_gpu(raw_rgb)
@@ -2952,9 +3185,16 @@ def main(argv: list[str] | None = None) -> int:
                                     out_f = backbone_extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
                                     extracted_list.append(out_f.features)
                                 contexts = torch.cat(extracted_list, dim=0).to(device=device)
-                            if not args.augment:
-                                for b_item, ctx_t in zip(batch_items, contexts, strict=False):
-                                    ram_cache[b_item.sample_id] = ctx_t.detach().cpu()
+                            if (
+                                not args.augment
+                                and not getattr(backbone_extractor, "_ram_cache_full", False)
+                                and len(ram_cache) < 4096
+                            ):
+                                if len(ram_cache) % 128 == 0 and OnlineVideoDataset._get_available_ram_bytes() < 14 * (1024**3):
+                                    backbone_extractor._ram_cache_full = True
+                                else:
+                                    for b_item, ctx_t in zip(batch_items, contexts, strict=False):
+                                        ram_cache[b_item.sample_id] = ctx_t.detach().cpu()
             else:
                 contexts = torch.stack([item.context for item in batch_items]).to(device=device)
             action_is_pad = torch.stack([item.action_is_pad for item in batch_items]).to(
@@ -3046,8 +3286,8 @@ def main(argv: list[str] | None = None) -> int:
             marker = " *** BEST ***" if is_best else ""
             if eval2_dataset is not None:
                 print(
-                    f"[Eval @ {opt_step}] Eval-1 RMSE: {rmse:.3f} (Arm: {arm_rmse:.3f}°, Grip: {gripper_rmse:.3f}) | H1: {h1:.3f} | First-5: {first5:.3f} "
-                    f"|| Eval-2 RMSE: {eval2_rmse:.3f} (Arm: {eval2_arm:.3f}°, Grip: {eval2_grip:.3f}) | H1: {eval2_h1:.3f} | First-5: {eval2_first5:.3f} "
+                    f"[Eval @ {opt_step}] Eval-1 Val Loss: {flow:.4f} | RMSE: {rmse:.3f} (Arm: {arm_rmse:.3f}°, Grip: {gripper_rmse:.3f}) | H1: {h1:.3f} | First-5: {first5:.3f} "
+                    f"|| Eval-2 Val Loss: {eval2_flow:.4f} | RMSE: {eval2_rmse:.3f} (Arm: {eval2_arm:.3f}°, Grip: {eval2_grip:.3f}) | H1: {eval2_h1:.3f} | First-5: {eval2_first5:.3f} "
                     f"(Patience: {early_stopping.bad_evaluations}/{early_stopping.patience}){marker}",
                     flush=True,
                 )
@@ -3056,8 +3296,8 @@ def main(argv: list[str] | None = None) -> int:
                     f" | Cart: {val_metrics['cart_pos_mm']:.2f}mm" if "cart_pos_mm" in val_metrics else ""
                 )
                 print(
-                    f"[Eval @ {opt_step}] RMSE: {rmse:.3f} (Arm: {arm_rmse:.3f}°, Grip: {gripper_rmse:.3f}){cart_info} | "
-                    f"H1: {h1:.3f} | First-5: {first5:.3f} | Flow Loss: {flow:.4f} "
+                    f"[Eval @ {opt_step}] Val Loss: {flow:.4f} | RMSE: {rmse:.3f} (Arm: {arm_rmse:.3f}°, Grip: {gripper_rmse:.3f}){cart_info} | "
+                    f"H1: {h1:.3f} | First-5: {first5:.3f} "
                     f"(Patience: {early_stopping.bad_evaluations}/{early_stopping.patience}){marker}",
                     flush=True,
                 )
