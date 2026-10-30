@@ -418,7 +418,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         self.config: Cosmos3ExtractorConfig = config
         self._torch_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
 
-        # 1. Initialize or assign Transformer
+        # 1. Initialize or assign Transformer (keep on CPU until unused blocks/heads are pruned)
+        loaded_transformer_from_disk = False
         if config.checkpoint_path is not None and not Path(config.checkpoint_path).exists():
             fallback_dir = Path.home() / ".cache/video-vam/cosmos3-edge"
             if not (fallback_dir / "transformer").is_dir():
@@ -437,7 +438,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             self.transformer = Cosmos3OmniTransformer.from_pretrained(
                 str(trans_path),
                 torch_dtype=self._torch_dtype,
-            ).to(self.device)
+            )
+            loaded_transformer_from_disk = True
         else:
             raise Cosmos3FeatureError("Must provide transformer instance or checkpoint_path")
 
@@ -466,17 +468,42 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                     alpha=config.lora_alpha,
                 )
 
-        # 3. Initialize or assign VAE
+        # 3. Initialize text prompt embedding cache (before moving/pruning embed_tokens)
+        self.prompt_text = config.prompt
+        self.tokenizer = tokenizer
+        self._cached_prompt_embeds: Tensor | None = None
+        self._init_prompt_tokens()
+
+        if loaded_transformer_from_disk:
+            max_layer = max(self.config.hidden_layers)
+            if hasattr(self.transformer, "layers") and len(self.transformer.layers) > max_layer:
+                self.transformer.layers = self.transformer.layers[:max_layer]
+            for unused_attr in ("lm_head", "proj_out", "time_embedder", "action_proj_in", "action_proj_out"):
+                if hasattr(self.transformer, unused_attr):
+                    setattr(self.transformer, unused_attr, None)
+            embed_tokens_cpu = getattr(self.transformer, "embed_tokens", None)
+            if embed_tokens_cpu is not None:
+                self.transformer.embed_tokens = None
+            self.transformer = self.transformer.to(device=self.device, dtype=self._torch_dtype)
+            if embed_tokens_cpu is not None:
+                self.transformer.embed_tokens = embed_tokens_cpu.to(device="cpu", dtype=self._torch_dtype)
+
+        # 4. Initialize or assign VAE (prune unused decoder before moving to GPU)
         if vae is not None:
             self.vae = vae.to(device=self.device, dtype=self._torch_dtype)
         elif config.vae_path is not None or config.checkpoint_path is not None:
             v_path = (
                 Path(config.vae_path) if config.vae_path is not None else Path(config.checkpoint_path) / "vae"
             )
-            self.vae = AutoencoderKLWan.from_pretrained(
+            loaded_vae = AutoencoderKLWan.from_pretrained(
                 str(v_path),
                 torch_dtype=self._torch_dtype,
-            ).to(self.device)
+            )
+            if hasattr(loaded_vae, "decoder"):
+                loaded_vae.decoder = None
+            if hasattr(loaded_vae, "post_quant_conv"):
+                loaded_vae.post_quant_conv = None
+            self.vae = loaded_vae.to(device=self.device, dtype=self._torch_dtype)
         else:
             self.vae = None
 
@@ -484,12 +511,6 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             self.vae.eval()
             for p in self.vae.parameters():
                 p.requires_grad_(False)
-
-        # 4. Initialize text prompt embedding cache
-        self.prompt_text = config.prompt
-        self.tokenizer = tokenizer
-        self._cached_prompt_embeds: Tensor | None = None
-        self._init_prompt_tokens()
 
         # 5. Optional compilation
         if self.config.compile_dit:
@@ -507,9 +528,12 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 str(Path(self.config.checkpoint_path) / "text_tokenizer"), local_files_only=True
             )
         prompt_tokens = self.tokenizer(self.prompt_text).input_ids
-        prompt_input_ids = torch.tensor(prompt_tokens, dtype=torch.long, device=self.device)
+        embed_device = next(self.transformer.embed_tokens.parameters()).device
+        prompt_input_ids = torch.tensor(prompt_tokens, dtype=torch.long, device=embed_device)
         with torch.no_grad():
-            self._cached_prompt_embeds = self.transformer.embed_tokens(prompt_input_ids)
+            self._cached_prompt_embeds = self.transformer.embed_tokens(prompt_input_ids).to(
+                device=self.device, dtype=self._torch_dtype
+            )
 
     def compile_transformer(self, mode: str = "default") -> None:
         """Compile targeted transformer layers with PyTorch Inductor kernel fusion."""
