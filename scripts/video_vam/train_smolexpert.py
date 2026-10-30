@@ -1117,14 +1117,30 @@ def evaluate_validation(
                 ):
                     raise ValueError("Cosmos3 cache context must be bfloat16 [600, 2048]")
             elif extractor is not None:
-                raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
-                rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
-                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    extracted_eval = []
-                    for b_i in range(rgb_in.shape[0]):
-                        out_f = extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
-                        extracted_eval.append(out_f.features)
-                    contexts = torch.cat(extracted_eval, dim=0).to(device=device)
+                if not hasattr(extractor, "_val_context_cache"):
+                    cast(Any, extractor)._val_context_cache = {}
+                val_cache: dict[str, Tensor] = cast(Any, extractor)._val_context_cache
+                if all(item.sample_id in val_cache for item in batch_items):
+                    contexts = torch.stack([val_cache[item.sample_id] for item in batch_items]).to(device=device)
+                else:
+                    raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
+                    rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
+                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        if hasattr(extractor, "encode_latents") and hasattr(
+                            extractor, "forward_transformer_blocks"
+                        ):
+                            lat_b = extractor.encode_latents(rgb_in)
+                            tap_b = extractor.forward_transformer_blocks(lat_b)
+                            lyr_k = next(iter(tap_b.keys()))
+                            contexts = tap_b[lyr_k].to(device=device)
+                        else:
+                            extracted_eval = []
+                            for b_i in range(rgb_in.shape[0]):
+                                out_f = extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
+                                extracted_eval.append(out_f.features)
+                            contexts = torch.cat(extracted_eval, dim=0).to(device=device)
+                        for b_item, ctx_t in zip(batch_items, contexts, strict=False):
+                            val_cache[b_item.sample_id] = ctx_t.detach().cpu()
             else:
                 raise ValueError(
                     "Evaluation requires cached context or an extractor; random features are forbidden"
@@ -2727,6 +2743,12 @@ def main(argv: list[str] | None = None) -> int:
     total_params = sum(p.numel() for p in trainable_params)
     print(f"Trainable parameters: {total_params:,}")
 
+    if not args.eval_only and args.model_checkpoint and args.model_checkpoint.is_file():
+        print(f"Warm-starting SmolExpert weights from {args.model_checkpoint}...")
+        warm_sd = load_file(str(args.model_checkpoint))
+        warm_sd = {k.replace("model.", ""): v for k, v in warm_sd.items()}
+        decoder.load_state_dict(warm_sd)
+
     # Eval-only execution
     if args.eval_only:
         ckpt_to_load = None
@@ -2855,18 +2877,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     start_time = time.time()
 
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    def _fetch_batch(batch_indices: list[int]) -> list[Any]:
+        return [train_dataset[i] for i in batch_indices]
+
+    def _next_batch_indices() -> list[int]:
+        nonlocal data_idx
+        out_idxs: list[int] = []
+        for _ in range(args.batch_size):
+            out_idxs.append(indices[data_idx])
+            data_idx += 1
+            if data_idx >= len(indices):
+                random.shuffle(indices)
+                data_idx = 0
+        return out_idxs
+
+    prefetch_pool = ThreadPoolExecutor(max_workers=8) if (is_online and not args.dry_run) else None
+    prefetch_queue: list[Future[list[Any]]] = []
+    if prefetch_pool is not None:
+        for _ in range(4):
+            prefetch_queue.append(prefetch_pool.submit(_fetch_batch, _next_batch_indices()))
+
+    if is_online and not args.dry_run and backbone_extractor is not None and not hasattr(backbone_extractor, "_online_ram_cache"):
+        backbone_extractor._online_ram_cache = {}
+
     while opt_step < args.max_steps:
         optimizer.zero_grad()
         accum_loss = 0.0
 
         for _micro_step in range(args.grad_accum_steps):
-            batch_items: list[Any] = []
-            for _ in range(args.batch_size):
-                batch_items.append(train_dataset[indices[data_idx]])
-                data_idx += 1
-                if data_idx >= len(indices):
-                    random.shuffle(indices)
-                    data_idx = 0
+            if prefetch_pool is not None:
+                batch_items = prefetch_queue.pop(0).result()
+                prefetch_queue.append(prefetch_pool.submit(_fetch_batch, _next_batch_indices()))
+            else:
+                batch_items = _fetch_batch(_next_batch_indices())
 
             states = torch.stack([item.state for item in batch_items]).to(device=device, dtype=torch.float32)
             actions = torch.stack([item.action for item in batch_items]).to(
@@ -2877,36 +2922,39 @@ def main(argv: list[str] | None = None) -> int:
                     contexts = torch.randn(len(batch_items), num_tokens, input_channels, device=device)
                 else:
                     assert backbone_extractor is not None
-                    raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
-                    if args.augment:
-                        if getattr(args, "aug_strategy", "physics") == "physics":
-                            rgb_in = physics_augment_temporal_window_gpu(raw_rgb)
-                        else:
-                            rgb_in = augment_temporal_window_gpu(
-                                raw_rgb, spatial_crop=getattr(args, "spatial_crop", False)
-                            )
+                    ram_cache: dict[str, Tensor] = getattr(backbone_extractor, "_online_ram_cache", {})
+                    if not args.augment and all(item.sample_id in ram_cache for item in batch_items):
+                        contexts = torch.stack([ram_cache[item.sample_id] for item in batch_items]).to(
+                            device=device
+                        )
                     else:
-                        rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
-
-                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                        if hasattr(backbone_extractor, "encode_latents") and hasattr(
-                            backbone_extractor, "forward_transformer_blocks"
-                        ):
-                            # Batched VAE encode across all B samples simultaneously (2.3x faster)
-                            latents_batch = backbone_extractor.encode_latents(rgb_in)
-                            extracted_list = []
-                            for b_i in range(latents_batch.shape[0]):
-                                tapped = backbone_extractor.forward_transformer_blocks(
-                                    latents_batch[b_i : b_i + 1]
+                        raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
+                        if args.augment:
+                            if getattr(args, "aug_strategy", "physics") == "physics":
+                                rgb_in = physics_augment_temporal_window_gpu(raw_rgb)
+                            else:
+                                rgb_in = augment_temporal_window_gpu(
+                                    raw_rgb, spatial_crop=getattr(args, "spatial_crop", False)
                                 )
-                                extracted_list.append(tapped[args.backbone_layer])
-                            contexts = torch.cat(extracted_list, dim=0).to(device=device)
                         else:
-                            extracted_list = []
-                            for b_i in range(rgb_in.shape[0]):
-                                out_f = backbone_extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
-                                extracted_list.append(out_f.features)
-                            contexts = torch.cat(extracted_list, dim=0).to(device=device)
+                            rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
+
+                        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                            if hasattr(backbone_extractor, "encode_latents") and hasattr(
+                                backbone_extractor, "forward_transformer_blocks"
+                            ):
+                                latents_batch = backbone_extractor.encode_latents(rgb_in)
+                                tapped = backbone_extractor.forward_transformer_blocks(latents_batch)
+                                contexts = tapped[args.backbone_layer].to(device=device)
+                            else:
+                                extracted_list = []
+                                for b_i in range(rgb_in.shape[0]):
+                                    out_f = backbone_extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
+                                    extracted_list.append(out_f.features)
+                                contexts = torch.cat(extracted_list, dim=0).to(device=device)
+                            if not args.augment:
+                                for b_item, ctx_t in zip(batch_items, contexts, strict=False):
+                                    ram_cache[b_item.sample_id] = ctx_t.detach().cpu()
             else:
                 contexts = torch.stack([item.context for item in batch_items]).to(device=device)
             action_is_pad = torch.stack([item.action_is_pad for item in batch_items]).to(

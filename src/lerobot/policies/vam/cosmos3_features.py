@@ -19,13 +19,107 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
-from diffusers.models.transformers.transformer_cosmos3 import Cosmos3OmniTransformer
+from diffusers.models.transformers.transformer_cosmos3 import Cosmos3OmniTransformer, _rotate_half
 from diffusers.pipelines.cosmos.pipeline_cosmos3_omni import (
     get_3d_mrope_ids_text_tokens,
     get_3d_mrope_ids_vae_tokens,
 )
 from torch import Tensor, nn
+
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except Exception:  # pragma: no cover - optional on non-CUDA platforms
+    _TRITON_AVAILABLE = False
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _fused_rmsnorm_rope_kernel(
+        X_ptr,
+        W_ptr,
+        COS_ptr,
+        SIN_ptr,
+        OUT_ptr,
+        stride_xb,
+        stride_xs,
+        stride_xh,
+        stride_cs,
+        HALF_DIM: tl.constexpr,
+        EPS: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        pid_h = tl.program_id(2)
+
+        offs = tl.arange(0, HALF_DIM)
+        base_x = X_ptr + pid_b * stride_xb + pid_s * stride_xs + pid_h * stride_xh
+        x0 = tl.load(base_x + offs).to(tl.float32)
+        x1 = tl.load(base_x + HALF_DIM + offs).to(tl.float32)
+
+        w0 = tl.load(W_ptr + offs)
+        w1 = tl.load(W_ptr + HALF_DIM + offs)
+
+        mean_sq = (tl.sum(x0 * x0, axis=0) + tl.sum(x1 * x1, axis=0)) / (2 * HALF_DIM)
+        rstd = tl.rsqrt(mean_sq + EPS)
+
+        n0 = ((x0 * rstd).to(tl.bfloat16) * w0).to(tl.bfloat16)
+        n1 = ((x1 * rstd).to(tl.bfloat16) * w1).to(tl.bfloat16)
+
+        base_c = COS_ptr + pid_s * stride_cs
+        base_s = SIN_ptr + pid_s * stride_cs
+        c0 = tl.load(base_c + offs)
+        c1 = tl.load(base_c + HALF_DIM + offs)
+        s0 = tl.load(base_s + offs)
+        s1 = tl.load(base_s + HALF_DIM + offs)
+
+        out0 = n0 * c0 - n1 * s0
+        out1 = n1 * c1 + n0 * s1
+
+        base_out = OUT_ptr + pid_b * stride_xb + pid_s * stride_xs + pid_h * stride_xh
+        tl.store(base_out + offs, out0)
+        tl.store(base_out + HALF_DIM + offs, out1)
+
+
+def fused_rmsnorm_rope(
+    x: Tensor,
+    norm_module: nn.Module,
+    cos: Tensor,
+    sin: Tensor,
+) -> Tensor:
+    """Apply head-wise RMSNorm followed by 3D-mRoPE rotation (uses custom Triton kernel on CUDA bf16)."""
+    if (
+        _TRITON_AVAILABLE
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and getattr(norm_module, "weight", None) is not None
+    ):
+        B, S, H, D = x.shape
+        x_contig = x if x.is_contiguous() else x.contiguous()
+        out = torch.empty_like(x_contig)
+        eps = float(getattr(norm_module, "eps", 1e-6))
+        _fused_rmsnorm_rope_kernel[(B, S, H)](
+            x_contig,
+            norm_module.weight,
+            cos,
+            sin,
+            out,
+            x_contig.stride(0),
+            x_contig.stride(1),
+            x_contig.stride(2),
+            cos.stride(0),
+            HALF_DIM=D // 2,
+            EPS=eps,
+        )
+        return out
+    normed = norm_module(x)
+    cos_b = cos.unsqueeze(0).unsqueeze(2)
+    sin_b = sin.unsqueeze(0).unsqueeze(2)
+    return normed * cos_b + _rotate_half(normed) * sin_b
 
 from lerobot.policies.vam.base import (
     BaseExtractorConfig,
@@ -476,6 +570,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         self.prompt_text = config.prompt
         self.tokenizer = tokenizer
         self._cached_prompt_embeds: Tensor | None = None
+        self._cached_und_kv: list[tuple[Tensor, Tensor]] | None = None
+        self._cached_gen_rotary: dict[tuple[int, int, int], tuple[Tensor, Tensor]] = {}
         self._init_prompt_tokens()
 
         if loaded_transformer_from_disk:
@@ -489,6 +585,7 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             if embed_tokens_cpu is not None:
                 self.transformer.embed_tokens = None
             self.transformer = self.transformer.to(device=self.device, dtype=self._torch_dtype)
+            self._precompute_and_prune_und_pathway()
             if embed_tokens_cpu is not None:
                 self.transformer.embed_tokens = embed_tokens_cpu.to(device="cpu", dtype=self._torch_dtype)
 
@@ -544,6 +641,122 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 device=self.device, dtype=self._torch_dtype
             )
 
+    def _supports_fast_batched_gen(self) -> bool:
+        if not hasattr(self.transformer, "layers") or len(self.transformer.layers) == 0:
+            return False
+        blk0 = self.transformer.layers[0]
+        return (
+            hasattr(blk0, "self_attn")
+            and hasattr(blk0.self_attn, "add_q_proj")
+            and hasattr(blk0, "mlp_moe_gen")
+        )
+
+    @torch.no_grad()
+    def _compute_und_kv_for_embeds(self, text_embeds: Tensor) -> list[tuple[Tensor, Tensor]]:
+        und_seq = text_embeds.to(device=self.device, dtype=self._torch_dtype)
+        if und_seq.ndim == 3 and und_seq.shape[0] == 1:
+            und_seq = und_seq.squeeze(0)
+        num_text_tokens = und_seq.shape[0]
+        t_cfg = getattr(self.transformer, "config", None)
+        enable_fps = getattr(t_cfg, "enable_fps_modulation", True)
+        text_mrope_ids, _ = get_3d_mrope_ids_text_tokens(
+            num_tokens=num_text_tokens,
+            temporal_offset=0,
+            use_float_positions=enable_fps,
+        )
+        position_ids = text_mrope_ids.to(device=self.device)
+        cos, sin = self.transformer.rotary_emb(
+            position_ids=position_ids.unsqueeze(1),
+            device=self.device,
+            dtype=self._torch_dtype,
+        )
+        cos_u = cos.squeeze(0).unsqueeze(1)
+        sin_u = sin.squeeze(0).unsqueeze(1)
+
+        kv_cache: list[tuple[Tensor, Tensor]] = []
+        curr_und = und_seq
+        for blk in self.transformer.layers:
+            u_norm = blk.input_layernorm(curr_und)
+            attn = blk.self_attn
+            q_u = attn.norm_q(attn.to_q(u_norm).view(-1, attn.num_attention_heads, attn.head_dim))
+            k_u = attn.norm_k(attn.to_k(u_norm).view(-1, attn.num_key_value_heads, attn.head_dim))
+            v_u = attn.to_v(u_norm).view(-1, attn.num_key_value_heads, attn.head_dim)
+            k_u_gen = attn.k_norm_und_for_gen(k_u) if attn.k_norm_und_for_gen is not None else k_u
+            q_u = q_u * cos_u + _rotate_half(q_u) * sin_u
+            k_u = k_u * cos_u + _rotate_half(k_u) * sin_u
+            k_u_gen = k_u_gen * cos_u + _rotate_half(k_u_gen) * sin_u
+            kv_cache.append((k_u_gen.unsqueeze(0).contiguous(), v_u.unsqueeze(0).contiguous()))
+            c_out = (
+                dispatch_attention_fn(
+                    q_u.unsqueeze(0),
+                    k_u.unsqueeze(0),
+                    v_u.unsqueeze(0),
+                    is_causal=True,
+                    enable_gqa=True,
+                )
+                .squeeze(0)
+                .flatten(-2, -1)
+            )
+            res_u = curr_und + attn.to_out(c_out)
+            curr_und = res_u + blk.mlp(blk.post_attention_layernorm(res_u))
+        return kv_cache
+
+    @torch.no_grad()
+    def _precompute_and_prune_und_pathway(self) -> None:
+        if not self._supports_fast_batched_gen() or self._cached_prompt_embeds is None:
+            return
+        self._cached_und_kv = self._compute_und_kv_for_embeds(self._cached_prompt_embeds)
+        for blk in self.transformer.layers:
+            if hasattr(blk, "mlp"):
+                blk.mlp = None
+            if hasattr(blk, "input_layernorm"):
+                blk.input_layernorm = None
+            if hasattr(blk, "post_attention_layernorm"):
+                blk.post_attention_layernorm = None
+            attn = getattr(blk, "self_attn", None)
+            if attn is not None:
+                for attr in ("to_q", "to_k", "to_v", "to_out", "norm_q", "norm_k", "k_norm_und_for_gen"):
+                    if hasattr(attn, attr):
+                        setattr(attn, attr, None)
+
+    def _get_gen_rotary(self, num_text_tokens: int, grid_shape: tuple[int, int, int]) -> tuple[Tensor, Tensor]:
+        key = (num_text_tokens, *grid_shape)
+        cached = self._cached_gen_rotary.get(key)
+        if cached is not None:
+            return cached
+        t_cfg = getattr(self.transformer, "config", None)
+        enable_fps = getattr(t_cfg, "enable_fps_modulation", True)
+        modality_margin = getattr(t_cfg, "unified_3d_mrope_temporal_modality_margin", 15000)
+        base_fps_val = float(getattr(t_cfg, "base_fps", self.config.base_fps))
+        reset_spatial = getattr(t_cfg, "unified_3d_mrope_reset_spatial_ids", True)
+        _, next_mrope_offset = get_3d_mrope_ids_text_tokens(
+            num_tokens=num_text_tokens,
+            temporal_offset=0,
+            use_float_positions=enable_fps,
+        )
+        vision_temporal_offset = next_mrope_offset + modality_margin
+        effective_fps = self.config.fps if enable_fps else None
+        grid_t, patch_h, patch_w = grid_shape
+        vision_mrope_ids, _ = get_3d_mrope_ids_vae_tokens(
+            grid_t=grid_t,
+            grid_h=patch_h,
+            grid_w=patch_w,
+            temporal_offset=vision_temporal_offset,
+            reset_spatial_indices=reset_spatial,
+            fps=effective_fps,
+            base_fps=base_fps_val,
+            temporal_compression_factor=self.config.temporal_compression_factor,
+        )
+        position_ids = vision_mrope_ids.to(device=self.device)
+        cos, sin = self.transformer.rotary_emb(
+            position_ids=position_ids.unsqueeze(1),
+            device=self.device,
+            dtype=self._torch_dtype,
+        )
+        pair = (cos.squeeze(0).contiguous(), sin.squeeze(0).contiguous())
+        self._cached_gen_rotary[key] = pair
+        return pair
+
     def compile_transformer(self, mode: str = "default") -> None:
         """Compile targeted transformer layers with PyTorch Inductor kernel fusion."""
         max_block = max(lyr - 1 for lyr in self.config.hidden_layers)
@@ -571,6 +784,45 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         timestep: float | Tensor = 0.0,
     ) -> dict[int, Tensor]:
         """Forward latents through Cosmos 3 Transformer and tap requested layer representations."""
+        if latents.shape[0] == 0:
+            raise ValueError("latents cannot be empty")
+
+        if (
+            self._supports_fast_batched_gen()
+            and self._cached_und_kv is not None
+            and text_conditioning is None
+        ):
+            packed_latent, grid_shape = patchify_and_pack_cosmos3_vision_latents(
+                latents, patch_size=self.config.latent_patch_size
+            )
+            g = self.transformer.proj_in(packed_latent.to(dtype=self._torch_dtype, device=self.device))
+            b_cur = g.shape[0]
+            num_text_tokens = self._cached_und_kv[0][0].shape[1]
+            cos_g, sin_g = self._get_gen_rotary(num_text_tokens, grid_shape)
+            max_block_idx = max(lyr - 1 for lyr in self.config.hidden_layers)
+            target_set = set(self.config.hidden_layers)
+            captured: dict[int, Tensor] = {}
+            for idx in range(min(max_block_idx + 1, len(self.transformer.layers))):
+                blk = self.transformer.layers[idx]
+                k_u_g, v_u_g = self._cached_und_kv[idx]
+                g_norm = blk.input_layernorm_moe_gen(g)
+                attn = blk.self_attn
+                q_raw = attn.add_q_proj(g_norm).view(b_cur, -1, attn.num_attention_heads, attn.head_dim)
+                k_raw = attn.add_k_proj(g_norm).view(b_cur, -1, attn.num_key_value_heads, attn.head_dim)
+                v_g = attn.add_v_proj(g_norm).view(b_cur, -1, attn.num_key_value_heads, attn.head_dim)
+                q_g = fused_rmsnorm_rope(q_raw, attn.norm_added_q, cos_g, sin_g)
+                k_g = fused_rmsnorm_rope(k_raw, attn.norm_added_k, cos_g, sin_g)
+                all_k = torch.cat([k_u_g.expand(b_cur, -1, -1, -1), k_g], dim=1)
+                all_v = torch.cat([v_u_g.expand(b_cur, -1, -1, -1), v_g], dim=1)
+                f_out = dispatch_attention_fn(
+                    q_g, all_k, all_v, is_causal=False, enable_gqa=True
+                ).flatten(-2, -1)
+                res_g = g + attn.to_add_out(f_out)
+                g = res_g + blk.mlp_moe_gen(blk.post_attention_layernorm_moe_gen(res_g))
+                lyr_num = idx + 1
+                if lyr_num in target_set:
+                    captured[lyr_num] = g.detach()
+            return captured
 
         if latents.shape[0] > 1:
             batched_tapped: dict[int, list[Tensor]] = {lyr: [] for lyr in self.config.hidden_layers}
@@ -583,8 +835,6 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 for lyr in self.config.hidden_layers:
                     batched_tapped[lyr].append(single_tapped[lyr])
             return {lyr: torch.cat(tensors, dim=0) for lyr, tensors in batched_tapped.items()}
-        if latents.shape[0] == 0:
-            raise ValueError("latents cannot be empty")
         # 1. Patchify latents and project to transformer hidden dim
         packed_latent, grid_shape = patchify_and_pack_cosmos3_vision_latents(
             latents, patch_size=self.config.latent_patch_size
