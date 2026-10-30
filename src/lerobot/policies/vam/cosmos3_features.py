@@ -84,6 +84,213 @@ if _TRITON_AVAILABLE:
         tl.store(base_out + offs, out0)
         tl.store(base_out + HALF_DIM + offs, out1)
 
+    @triton.jit
+    def _wan_rmsnorm_nhwc_kernel(
+        X_ptr,
+        G_ptr,
+        OUT_ptr,
+        C: tl.constexpr,
+        T_in,
+        T_out,
+        HW,
+        PAD_T: tl.constexpr,
+        SCALE: tl.constexpr,
+        APPLY_SILU: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+    ):
+        pid_hw = tl.program_id(0)
+        pid_bt = tl.program_id(1)
+        b = pid_bt // T_in
+        t = pid_bt % T_in
+
+        offs_c = tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+
+        in_idx = ((b * T_in + t) * HW + pid_hw) * C
+        out_idx = ((b * T_out + (t + PAD_T)) * HW + pid_hw) * C
+
+        x_val = tl.load(X_ptr + in_idx + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        sum_sq = tl.sum(x_val * x_val, axis=0)
+        inv_norm = 1.0 / tl.maximum(tl.sqrt(sum_sq), 1e-12)
+
+        g_val = tl.load(G_ptr + offs_c, mask=mask_c, other=0.0).to(tl.bfloat16)
+        normed = (x_val * inv_norm).to(tl.bfloat16)
+        y = (normed * SCALE * g_val).to(tl.bfloat16)
+        if APPLY_SILU:
+            yf = y.to(tl.float32)
+            y = (yf * tl.sigmoid(yf)).to(tl.bfloat16)
+        tl.store(OUT_ptr + out_idx + offs_c, y, mask=mask_c)
+
+
+def triton_wan_rmsnorm_nhwc(
+    x: Tensor,
+    norm_mod: nn.Module,
+    apply_silu: bool = False,
+    pad_t: int = 0,
+) -> Tensor:
+    """Single-pass channel-wise RMSNorm (+ optional SiLU + optional causal time pad) in channels_last_3d layout."""
+    if not (_TRITON_AVAILABLE and x.is_cuda and x.dtype == torch.bfloat16):
+        out = norm_mod(x)
+        if apply_silu:
+            out = torch.nn.functional.silu(out)
+        if pad_t > 0 and out.ndim == 5:
+            out = torch.nn.functional.pad(out, (0, 0, 0, 0, pad_t, 0))
+        return out
+    if x.ndim == 4:
+        return triton_wan_rmsnorm_nhwc(x.unsqueeze(2), norm_mod, apply_silu=apply_silu, pad_t=0).squeeze(2)
+    if not x.is_contiguous(memory_format=torch.channels_last_3d):
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    B, C, T, H, W = x.shape
+    HW = H * W
+    T_out = T + pad_t
+    out = torch.empty((B, C, T_out, H, W), device=x.device, dtype=x.dtype, memory_format=torch.channels_last_3d)
+    if pad_t > 0:
+        out[:, :, :pad_t, :, :].zero_()
+    BLOCK_C = triton.next_power_of_2(C)
+    _wan_rmsnorm_nhwc_kernel[(HW, B * T)](
+        x,
+        norm_mod.gamma,
+        out,
+        C=C,
+        T_in=T,
+        T_out=T_out,
+        HW=HW,
+        PAD_T=pad_t,
+        SCALE=float(norm_mod.scale),
+        APPLY_SILU=apply_silu,
+        BLOCK_C=BLOCK_C,
+        num_warps=4,
+    )
+    return out
+
+
+def optimize_wan_vae_encoder(vae: AutoencoderKLWan) -> None:
+    """Optimize Wan2.2 3D Causal VAE encoder for single-pass channels_last_3d execution with fused Triton kernels."""
+    import types
+    import torch.nn.functional as F
+    from diffusers.models.autoencoders.autoencoder_kl_wan import (
+        AvgDown3D,
+        WanCausalConv3d,
+        WanEncoder3d,
+        WanResidualBlock,
+        WanResidualDownBlock,
+        WanResample,
+        WanRMS_norm,
+    )
+
+    if getattr(vae, "_fast_single_pass_enabled", False) or not hasattr(vae, "encoder") or vae.encoder is None:
+        return
+
+    for m in vae.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last_3d)
+        elif isinstance(m, nn.Conv2d):
+            m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last)
+
+    def _fast_causal_conv_forward(self, x: Tensor, cache_x: Tensor | None = None, time_pre_padded: bool = False) -> Tensor:
+        pad_w, _, pad_h, _, pad_t, _ = self._padding
+        if not time_pre_padded:
+            if cache_x is not None and pad_t > 0:
+                cache_x = cache_x.to(x.device)
+                x = torch.cat([cache_x, x], dim=2)
+                pad_t -= cache_x.shape[2]
+            if pad_t > 0:
+                B, C, T, H, W = x.shape
+                out_pad = torch.empty(
+                    (B, C, T + pad_t, H, W),
+                    device=x.device,
+                    dtype=x.dtype,
+                    memory_format=torch.channels_last_3d,
+                )
+                out_pad[:, :, :pad_t].zero_()
+                out_pad[:, :, pad_t:].copy_(x)
+                x = out_pad
+        if not x.is_contiguous(memory_format=torch.channels_last_3d):
+            x = x.contiguous(memory_format=torch.channels_last_3d)
+        return F.conv3d(x, self.weight, self.bias, self.stride, (0, pad_h, pad_w), self.dilation, self.groups)
+
+    def _fast_resblock_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+        if feat_cache is not None:
+            return WanResidualBlock.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx or [0])
+        h = self.conv_shortcut(x)
+        x = triton_wan_rmsnorm_nhwc(x, self.norm1, apply_silu=True, pad_t=self.conv1._padding[4])
+        x = self.conv1(x, time_pre_padded=True)
+        x = triton_wan_rmsnorm_nhwc(x, self.norm2, apply_silu=True, pad_t=self.conv2._padding[4])
+        x = self.conv2(x, time_pre_padded=True)
+        return x + h
+
+    def _fast_avgdown_forward(self, x: Tensor) -> Tensor:
+        if self.factor_t == 1 and self.factor_s == 1 and self.in_channels == self.out_channels:
+            return x
+        x_c = x.contiguous()
+        pad_t = (self.factor_t - x_c.shape[2] % self.factor_t) % self.factor_t
+        if pad_t > 0:
+            x_c = F.pad(x_c, (0, 0, 0, 0, pad_t, 0))
+        B, C, T, H, W = x_c.shape
+        x_c = x_c.view(
+            B, C, T // self.factor_t, self.factor_t, H // self.factor_s, self.factor_s, W // self.factor_s, self.factor_s
+        )
+        x_c = x_c.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
+        x_c = x_c.view(B, self.out_channels, self.group_size, T // self.factor_t, H // self.factor_s, W // self.factor_s)
+        return x_c.mean(dim=2).contiguous(memory_format=torch.channels_last_3d)
+
+    def _fast_resdown_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+        x_in = x
+        for resnet in self.resnets:
+            x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        if self.downsampler is not None:
+            x = self.downsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        return x + self.avg_shortcut(x_in)
+
+    def _fast_resample_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+        if feat_cache is not None:
+            return WanResample.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx or [0])
+        b, c, t, h, w = x.size()
+        if x.is_contiguous(memory_format=torch.channels_last_3d):
+            x_2d = x.permute(0, 2, 3, 4, 1).view(b * t, h, w, c).permute(0, 3, 1, 2)
+        else:
+            x_2d = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w).contiguous(memory_format=torch.channels_last)
+        x_2d = self.resample(x_2d)
+        if x_2d.is_contiguous(memory_format=torch.channels_last):
+            x = x_2d.permute(0, 2, 3, 1).view(b, t, x_2d.size(2), x_2d.size(3), x_2d.size(1)).permute(0, 4, 1, 2, 3)
+        else:
+            x = x_2d.view(b, t, x_2d.size(1), x_2d.size(2), x_2d.size(3)).permute(0, 2, 1, 3, 4)
+        if self.mode == "downsample3d" and t > 1:
+            x = torch.cat([x[:, :, :1, :, :], self.time_conv(x)], dim=2).contiguous(
+                memory_format=torch.channels_last_3d
+            )
+        return x
+
+    def _fast_encoder_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+        if feat_cache is not None:
+            return WanEncoder3d.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx or [0])
+        x = self.conv_in(x)
+        for layer in self.down_blocks:
+            x = layer(x, feat_cache=None)
+        x = self.mid_block(x, feat_cache=None)
+        x = triton_wan_rmsnorm_nhwc(x, self.norm_out, apply_silu=True, pad_t=self.conv_out._padding[4])
+        x = self.conv_out(x, time_pre_padded=True)
+        return x
+
+    for m in vae.modules():
+        if isinstance(m, WanCausalConv3d):
+            m.forward = types.MethodType(_fast_causal_conv_forward, m)
+        elif isinstance(m, WanResidualBlock):
+            m.forward = types.MethodType(_fast_resblock_forward, m)
+        elif isinstance(m, AvgDown3D):
+            m.forward = types.MethodType(_fast_avgdown_forward, m)
+        elif isinstance(m, WanResidualDownBlock):
+            m.forward = types.MethodType(_fast_resdown_forward, m)
+        elif isinstance(m, WanResample):
+            m.forward = types.MethodType(_fast_resample_forward, m)
+        elif isinstance(m, WanRMS_norm):
+            m.forward = types.MethodType(
+                lambda self, x: triton_wan_rmsnorm_nhwc(x, self, apply_silu=False, pad_t=0), m
+            )
+
+    vae.encoder.forward = types.MethodType(_fast_encoder_forward, vae.encoder)
+    vae._fast_single_pass_enabled = True
+
 
 def fused_rmsnorm_rope(
     x: Tensor,
@@ -217,36 +424,62 @@ def encode_cosmos3_video(
         raise ValueError("RGB must be BCHW or BCTHW with three channels")
     if sample_mode not in {"argmax", "sample"}:
         raise ValueError("Invalid posterior mode")
-    if not torch.isfinite(rgb_frames).all():
-        raise ValueError("RGB must be finite")
-    if rgb_frames.dtype != torch.uint8 and (rgb_frames.min() < 0 or rgb_frames.max() > 1):
-        raise ValueError("Floating RGB must be [0,1]; retain uint8 for [0,255] input")
     param = next(vae.parameters(), None)
     target_device = param.device if param is not None else rgb_frames.device
     target_dtype = getattr(vae, "dtype", rgb_frames.dtype)
-    x = rgb_frames.to(dtype=target_dtype, device=target_device)
 
-    # Explicit RGB normalization contract
-    if rgb_frames.dtype == torch.uint8 or x.max() > 1.0:
-        x = x / 255.0
-        x = (x * 2.0) - 1.0
-    elif x.min() >= 0.0:
-        x = (x * 2.0) - 1.0
-
-    if x.ndim == 4:
-        x = x.unsqueeze(2)
+    if rgb_frames.dtype == torch.uint8:
+        x = rgb_frames.to(dtype=target_dtype, device=target_device)
+        if x.ndim == 4:
+            x = x.unsqueeze(2)
+        x = x.mul(2.0 / 255.0).sub_(1.0)
+    else:
+        if not torch.isfinite(rgb_frames).all():
+            raise ValueError("RGB must be finite")
+        if rgb_frames.min() < 0 or rgb_frames.max() > 1:
+            raise ValueError("Floating RGB must be [0,1]; retain uint8 for [0,255] input")
+        x = rgb_frames.to(dtype=target_dtype, device=target_device)
+        if x.ndim == 4:
+            x = x.unsqueeze(2)
+        if x.max() > 1.0:
+            x = (x / 255.0) * 2.0 - 1.0
+        elif x.min() >= 0.0:
+            x = (x * 2.0) - 1.0
 
     with torch.no_grad():
-        encoder_output = vae.encode(x)
-        if hasattr(encoder_output, "latent_dist"):
-            if sample_mode == "argmax":
-                raw_mu = encoder_output.latent_dist.mode()
-            else:
-                raw_mu = encoder_output.latent_dist.sample()
-        elif hasattr(encoder_output, "latents"):
-            raw_mu = encoder_output.latents
+        if (
+            getattr(vae, "_fast_single_pass_enabled", False)
+            and sample_mode == "argmax"
+            and x.shape[2] <= 5
+            and not getattr(vae, "use_tiling", False)
+        ):
+            from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+            x_in = patchify(x, patch_size=vae.config.patch_size) if vae.config.patch_size is not None else x
+            enc_feat = vae.encoder(x_in, feat_cache=None)
+            raw_mu = vae.quant_conv(enc_feat)[:, : vae.z_dim].contiguous()
         else:
-            raise Cosmos3FeatureError("Could not access latents from VAE encoder output")
+            encoder_output = vae.encode(x)
+            if hasattr(encoder_output, "latent_dist"):
+                if sample_mode == "argmax":
+                    raw_mu = encoder_output.latent_dist.mode()
+                else:
+                    raw_mu = encoder_output.latent_dist.sample()
+            elif hasattr(encoder_output, "latents"):
+                raw_mu = encoder_output.latents
+            else:
+                raise Cosmos3FeatureError("Could not access latents from VAE encoder output")
+
+    cached_stats = getattr(vae, "_cached_norm_stats", None)
+    if (
+        cached_stats is not None
+        and latents_mean is None
+        and latents_std is None
+        and cached_stats[0].device == raw_mu.device
+        and cached_stats[0].dtype == raw_mu.dtype
+    ):
+        mean_v, inv_std_v = cached_stats
+        return (raw_mu - mean_v) * inv_std_v
 
     mean_vec = (
         latents_mean
@@ -281,10 +514,11 @@ def encode_cosmos3_video(
     ):
         raise ValueError("Invalid per-channel VAE statistics")
     inv_std = 1.0 / std_t
-    normalized = (raw_mu - mean_t.view(1, -1, 1, 1, 1)) * inv_std.view(1, -1, 1, 1, 1)
-    del encoder_output, raw_mu, x
-    if normalized.is_cuda:
-        torch.cuda.empty_cache()
+    mean_v = mean_t.view(1, -1, 1, 1, 1)
+    inv_std_v = inv_std.view(1, -1, 1, 1, 1)
+    if latents_mean is None and latents_std is None:
+        vae._cached_norm_stats = (mean_v, inv_std_v)
+    normalized = (raw_mu - mean_v) * inv_std_v
     return normalized
 
 
@@ -612,6 +846,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             self.vae.eval()
             for p in self.vae.parameters():
                 p.requires_grad_(False)
+            if self.device.type == "cuda" and isinstance(self.vae, AutoencoderKLWan):
+                optimize_wan_vae_encoder(self.vae)
 
         if loaded_transformer_from_disk:
             gc.collect()
