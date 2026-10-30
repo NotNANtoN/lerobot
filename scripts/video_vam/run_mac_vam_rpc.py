@@ -1100,6 +1100,20 @@ def main(argv: list[str] | None = None) -> int:
         identity = _describe_server(args)
         # Pin a mutable `last` symlink before starting a process.
         args.resolved_checkpoint = identity["checkpoint"]
+        if _is_local_host(SSH_HOST) and args.policy == "video_vam":
+            ckpt_cfg_path = Path(args.resolved_checkpoint) / "config.json"
+            if ckpt_cfg_path.is_file():
+                ckpt_cfg = json.loads(ckpt_cfg_path.read_text())
+                if ckpt_cfg.get("backend") == "cosmos3_edge":
+                    c3_path = Path(ckpt_cfg.get("cosmos3_checkpoint", "/home/anton/.cache/video-vam/cosmos3-edge"))
+                    if not (c3_path / "transformer").is_dir():
+                        fallback_c3 = Path.home() / ".cache/video-vam/cosmos3-edge"
+                        if not (fallback_c3 / "transformer").is_dir():
+                            from huggingface_hub import snapshot_download
+
+                            print("[SETUP] Downloading nvidia/Cosmos3-Edge backbone to ~/.cache/video-vam/cosmos3-edge...")
+                            fallback_c3.mkdir(parents=True, exist_ok=True)
+                            snapshot_download("nvidia/Cosmos3-Edge", local_dir=str(fallback_c3))
         health = _healthz_payload(args.port)
         if health is None or should_restart_rpc(health_payload=health, requested_identity=identity):
             token = uuid.uuid4().hex

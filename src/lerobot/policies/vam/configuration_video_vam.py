@@ -70,6 +70,8 @@ class VideoVAMConfig(PreTrainedConfig):
     use_amp: bool = False
 
     camera_key: str = "observation.images.front"
+    chunk_size: int = 30
+    n_action_steps: int = 30
     dataset_revision: str = "243370c3c08bcbd860133c4a0d658ea7c1d2e77e"
     action_feature_names: list[str] = field(default_factory=lambda: list(ACTION_NAMES))
     action_seed: int = 0
