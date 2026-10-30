@@ -362,7 +362,7 @@ def tap_cosmos3_layers(
     return captured
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Cosmos3ExtractorConfig(BaseExtractorConfig):
     """Configuration for Cosmos 3 Edge feature extraction."""
 
@@ -426,8 +426,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
                 fallback_dir.mkdir(parents=True, exist_ok=True)
                 snapshot_download("nvidia/Cosmos3-Edge", local_dir=str(fallback_dir))
-            object.__setattr__(config, "checkpoint_path", fallback_dir)
-            object.__setattr__(self.config, "checkpoint_path", fallback_dir)
+            config.checkpoint_path = fallback_dir
+            self.config.checkpoint_path = fallback_dir
         if transformer is not None:
             self.transformer = transformer.to(device=self.device, dtype=self._torch_dtype)
         elif config.checkpoint_path is not None:

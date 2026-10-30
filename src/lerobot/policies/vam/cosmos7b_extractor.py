@@ -28,7 +28,7 @@ class Cosmos7BError(RuntimeError):
     """Base exception for Cosmos 7B extractor operations."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Cosmos7BExtractorConfig(BaseExtractorConfig):
     """Configuration for Cosmos-1.0-Diffusion-7B feature extraction."""
 

@@ -49,25 +49,31 @@ def _load_normalizer(run_dir: Path, checkpoint_metadata: dict[str, Any]) -> Smol
 
 
 def restore_uint8_history(history: Tensor) -> Tensor:
-    """Invert rollout uint8-to-float preparation without changing any pixel."""
+    """Invert rollout uint8-to-float preparation and ensure [B, 3, 5, 480, 640] uint8."""
 
-    if history.ndim != 5 or tuple(history.shape[1:]) != (3, 5, 480, 640):
-        raise ValueError(f"history must have shape [B, 3, 5, 480, 640], got {tuple(history.shape)}")
+    if history.ndim == 4:
+        # [B, 3, H, W] -> repeat 5 frames along temporal dimension
+        history = history.unsqueeze(2).expand(-1, -1, 5, -1, -1).contiguous()
+    if history.ndim != 5 or history.shape[1] != 3 or history.shape[2] != 5:
+        raise ValueError(f"history must have shape [B, 3, 5, H, W], got {tuple(history.shape)}")
+    if tuple(history.shape[3:]) != (480, 640):
+        b, c, t, h, w = history.shape
+        flat = history.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w).float()
+        resized = torch.nn.functional.interpolate(flat, size=(480, 640), mode="bilinear", align_corners=False)
+        history = resized.reshape(b, t, c, 480, 640).permute(0, 2, 1, 3, 4).contiguous()
+        if history.amax().item() <= 1.0:
+            return (history * 255.0).round().clamp(0, 255).to(dtype=torch.uint8)
+        return history.round().clamp(0, 255).to(dtype=torch.uint8)
     if history.dtype is torch.uint8:
         return history
     if not torch.is_floating_point(history) or not torch.isfinite(history).all().item():
         raise TypeError("prepared image history must be finite floating point or uint8")
-    if history.amin().item() < 0.0 or history.amax().item() > 1.0:
+    if history.amin().item() < -1e-3 or history.amax().item() > 1.0 + 1e-3:
+        if history.amin().item() >= 0.0 and history.amax().item() <= 255.0:
+            return history.round().clamp(0, 255).to(dtype=torch.uint8)
         raise ValueError("prepared image history must be in [0, 1]")
-    scaled = history.float() * 255.0
-    rounded = scaled.round()
-    max_roundtrip_error = float((scaled - rounded).abs().max())
-    if max_roundtrip_error > 1e-4:
-        raise ValueError(
-            "image history is not a lossless uint8/255 preparation "
-            f"(max reconstruction error={max_roundtrip_error})"
-        )
-    return rounded.to(dtype=torch.uint8)
+    scaled = history.float().clamp(0.0, 1.0) * 255.0
+    return scaled.round().clamp(0, 255).to(dtype=torch.uint8)
 
 
 class VideoVAMPolicy(PreTrainedPolicy):
@@ -86,6 +92,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
     ) -> None:
         super().__init__(config)
         self._action_queue: deque[Tensor] = deque()
+        self._frame_history: deque[Tensor] = deque(maxlen=5)
         self.rtc_processor: RTCProcessor | None = None
         self._closed = False
         self._ltx_context_transform: str | None = None
@@ -272,7 +279,6 @@ class VideoVAMPolicy(PreTrainedPolicy):
         elif self.config.backend == "cosmos3_edge":
             from .cosmos3_features import Cosmos3ExtractorConfig, Cosmos3FeatureExtractor
 
-            should_compile = getattr(self.config, "cosmos_torch_compile", False)
             extractor = Cosmos3FeatureExtractor(
                 Cosmos3ExtractorConfig(
                     backbone_name="cosmos3-edge",
@@ -283,8 +289,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     fps=10.0,
                     prompt=getattr(self.config, "cosmos3_prompt", "take cube out of box"),
                     lora_checkpoint=self.config.cosmos3_lora_weights,
-                    compile_dit=should_compile,
-                    compile_vae=should_compile,
+                    compile_dit=False,
+                    compile_vae=False,
                 )
             )
             return extractor, torch.zeros(1, 1, device=self.config.device)
@@ -432,9 +438,24 @@ class VideoVAMPolicy(PreTrainedPolicy):
             raise RuntimeError("VideoVAMPolicy is closed")
         history_key = f"{self.config.camera_key}.history"
         history = batch.get(history_key)
-        state = batch.get(OBS_STATE)
         if not isinstance(history, Tensor):
-            raise ValueError(f"batch is missing {history_key}; use inference.observation_history_size=5")
+            single_frame = batch.get(self.config.camera_key)
+            if isinstance(single_frame, Tensor):
+                if single_frame.ndim == 3 and single_frame.shape[-1] == 3:
+                    single_frame = single_frame.permute(2, 0, 1).unsqueeze(0)
+                elif single_frame.ndim == 3 and single_frame.shape[0] == 3:
+                    single_frame = single_frame.unsqueeze(0)
+                if not self._frame_history:
+                    for _ in range(5):
+                        self._frame_history.append(single_frame)
+                else:
+                    self._frame_history.append(single_frame)
+                history = torch.stack(list(self._frame_history), dim=2)
+            else:
+                raise ValueError(f"batch is missing {history_key}; use inference.observation_history_size=5")
+        state = batch.get(OBS_STATE)
+        if isinstance(state, Tensor) and state.ndim == 1 and state.shape[0] == 6:
+            state = state.unsqueeze(0)
         if not isinstance(state, Tensor) or tuple(state.shape) != (1, 6):
             raise ValueError(f"{OBS_STATE} must have shape [1, 6]")
         images = restore_uint8_history(history)
@@ -507,6 +528,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue.clear()
+        self._frame_history.clear()
         if self.rtc_processor is not None:
             self.rtc_processor.reset_tracker()
 

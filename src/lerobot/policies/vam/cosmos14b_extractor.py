@@ -111,7 +111,7 @@ class StreamingBlockList(nn.ModuleList):
             active.to(self.offload_device)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Cosmos14BExtractorConfig(BaseExtractorConfig):
     """Configuration for Cosmos-1.0-Diffusion-14B feature extraction."""
 

@@ -36,7 +36,7 @@ class Flux2KleinTapLocation(StrEnum):
     RECTIFIED_FLOW_TRAJECTORY = "rectified_flow_trajectory"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Flux2KleinExtractorConfig(BaseExtractorConfig):
     """Configuration for FLUX.2 [klein] 9B feature extraction."""
 

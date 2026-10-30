@@ -393,12 +393,12 @@ class VideoVAMRPCClient:
 
         if isinstance(frame, Image.Image):
             image = frame.convert("RGB")
-        elif isinstance(frame, np.ndarray) and frame.dtype == np.uint8 and frame.shape == (480, 640, 3):
+        elif isinstance(frame, np.ndarray) and frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3:
             image = Image.fromarray(frame, "RGB")
         else:
-            raise TypeError("front camera must supply an RGB uint8 [480,640,3] array or PIL image")
+            raise TypeError("front camera must supply an RGB uint8 [H,W,3] array or PIL image")
         if image.size != IMAGE_SIZE:
-            raise ValueError("front camera must be 640x480")
+            image = image.resize(IMAGE_SIZE, Image.Resampling.BILINEAR)
         return image.copy()
 
     @staticmethod

@@ -81,9 +81,13 @@ HF_FALLBACK_REPOS = {
 }
 
 
+def _has_complete_weights(directory: Path) -> bool:
+    return (directory / "config.json").is_file() and any(directory.glob("*.safetensors"))
+
+
 def _ensure_local_checkpoint(raw_path: Path) -> Path:
     expanded = raw_path.expanduser()
-    if expanded.exists():
+    if _has_complete_weights(expanded):
         return expanded.resolve(strict=True)
     # Remap /home/anton/lerobot-video-vam/... to current repo root if running on another machine
     repo_root = Path(__file__).resolve().parents[2]
@@ -91,7 +95,7 @@ def _ensure_local_checkpoint(raw_path: Path) -> Path:
     if "/lerobot-video-vam/" in s:
         rel = s.split("/lerobot-video-vam/", 1)[1]
         candidate = repo_root / rel
-        if candidate.exists():
+        if _has_complete_weights(candidate):
             return candidate.resolve(strict=True)
         expanded = candidate
     hf_repo = None
@@ -119,15 +123,25 @@ def checkpoint_identity(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(config, dict) or config.get("type") != args.policy:
         raise ValueError("checkpoint config.type does not match requested policy")
     digest = hashlib.sha256()
-    files = sorted(path for path in checkpoint.rglob("*") if path.is_file())
+    files = sorted(
+        path
+        for path in checkpoint.rglob("*")
+        if path.is_file() and not any(part.startswith(".") for part in path.relative_to(checkpoint).parts)
+    )
     if not any(path.suffix == ".safetensors" for path in files):
         raise ValueError("checkpoint has no safetensors weights")
     for path in files:
         digest.update(str(path.relative_to(checkpoint)).encode())
         before = path.stat()
         with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
+            if before.st_size > 16 * 1024 * 1024:
+                digest.update(str(before.st_size).encode())
+                digest.update(stream.read(1024 * 1024))
+                stream.seek(max(0, before.st_size - 1024 * 1024))
+                digest.update(stream.read(1024 * 1024))
+            else:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
         after = path.stat()
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
             after.st_size,

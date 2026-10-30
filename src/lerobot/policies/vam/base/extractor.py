@@ -25,7 +25,7 @@ class ExtractorConfigError(ValueError):
     """Raised when extractor configuration parameters are invalid."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class BaseExtractorConfig:
     """Standard configuration contract for Video Action Model extractors."""
 

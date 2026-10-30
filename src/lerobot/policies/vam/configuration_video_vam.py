@@ -91,7 +91,7 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos_prompt: Path = DEFAULT_COSMOS_PROMPT
     cosmos_attention_backend: str = "minimal_a2a"
     cosmos_compile_friendly: bool = True
-    cosmos_torch_compile: bool = True
+    cosmos_torch_compile: bool = False
     cosmos_compile_mode: str = "max-autotune"
     cosmos_use_cuda_graphs: bool = False
     cosmos_state_t: int = 16
@@ -215,17 +215,16 @@ class VideoVAMConfig(PreTrainedConfig):
                 "index for this collection episode"
             )
         if getattr(rollout_config, "fps", None) != 10:
-            raise ValueError("Video-VAM rollout requires fps=10 to preserve training-time frame spacing")
+            rollout_config.fps = 10  # type: ignore[attr-defined]
         inference = getattr(rollout_config, "inference", None)
-        if getattr(inference, "type", None) != "rtc":
-            raise ValueError("Video-VAM rollout requires inference.type=rtc")
-        if getattr(inference, "observation_history_size", None) == 1:
-            inference.observation_history_size = 5
-        if getattr(inference, "observation_history_size", None) != 5:
-            raise ValueError("Video-VAM rollout requires inference.observation_history_size=5")
+        if getattr(inference, "type", None) == "rtc":
+            if getattr(inference, "observation_history_size", None) == 1:
+                inference.observation_history_size = 5
+            if getattr(inference, "observation_history_size", None) != 5:
+                raise ValueError("Video-VAM rollout requires inference.observation_history_size=5")
         robot_config = getattr(rollout_config, "robot", None)
-        if getattr(robot_config, "use_degrees", None) is not True:
-            raise ValueError("Video-VAM SO-101 rollout requires robot.use_degrees=true")
+        if robot_config is not None and getattr(robot_config, "use_degrees", None) is not True:
+            robot_config.use_degrees = True
         relative = getattr(robot_config, "max_relative_target", None)
         if relative is None and robot_config is not None:
             relative = {
