@@ -10,6 +10,7 @@ tapping with early-exit truncation, and honest provenance tracking.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import math
 from collections.abc import Sequence
@@ -187,6 +188,9 @@ def encode_cosmos3_video(
         raise ValueError("Invalid per-channel VAE statistics")
     inv_std = 1.0 / std_t
     normalized = (raw_mu - mean_t.view(1, -1, 1, 1, 1)) * inv_std.view(1, -1, 1, 1, 1)
+    del encoder_output, raw_mu, x
+    if normalized.is_cuda:
+        torch.cuda.empty_cache()
     return normalized
 
 
@@ -511,6 +515,11 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             self.vae.eval()
             for p in self.vae.parameters():
                 p.requires_grad_(False)
+
+        if loaded_transformer_from_disk:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # 5. Optional compilation
         if self.config.compile_dit:
