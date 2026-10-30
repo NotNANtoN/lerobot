@@ -108,10 +108,17 @@ class VideoVAMPolicy(PreTrainedPolicy):
             metadata = _read_json(run_dir / "best.json")
             self._validate_checkpoint_contract(metadata)
         else:
+            manifest_steps = 10
+            if (run_dir / "run_manifest.json").is_file():
+                manifest = _read_json(run_dir / "run_manifest.json")
+                manifest_steps = int(manifest.get("policy", {}).get("num_steps", 10))
+                manifest_prompt = manifest.get("arguments", {}).get("backbone_prompt")
+                if isinstance(manifest_prompt, str) and manifest_prompt:
+                    config.cosmos3_prompt = manifest_prompt
             metadata = {
                 "expert_checkpoint": "lerobot/smolvla_base",
                 "hyperparameters": {"vlm_config": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"},
-                "action_semantics": {"euler_steps": 10},
+                "action_semantics": {"euler_steps": manifest_steps},
             }
         normalizer = _load_normalizer(run_dir, metadata)
         input_channels = 2048 if config.backend in ("cosmos", "cosmos3_edge") else 4096
@@ -264,7 +271,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     device=str(self.config.device),
                     dtype="bfloat16",
                     fps=10.0,
-                    prompt="take cube out of box",
+                    prompt=getattr(self.config, "cosmos3_prompt", "take cube out of box"),
                     lora_checkpoint=self.config.cosmos3_lora_weights,
                     compile_dit=should_compile,
                     compile_vae=should_compile,

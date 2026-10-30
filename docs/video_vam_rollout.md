@@ -30,6 +30,11 @@ Defined in `run_mac_vam_rpc.py` (paths on abakus). Status as of 2026-09-24:
 | `cosmos2b_t16`                                      | `cube-out-of-box-cosmos-pool2-smolexpert`        | T=16, ~1.2 s per chunk                 |
 | `cosmos2b_t2_undistilled` / `cosmos2b_t2_distilled` | `cosmos2b-t2-{undistilled,distilled}-smolexpert` | re-trained 09-09 (13.65 / 13.48 on v1) |
 | `smolvla_v1` / `smolvla_v2`                         | SmolVLA 29.2k (v1) / 25k (Scale-100)             | baselines                              |
+| `c3_sort_cubes_bs64`                                | `sort-cubes-cosmos3-edge-optimized-bs64`         | sort-cubes (`_no_top`) BS 64 (14.81)   |
+| `c3peft_sort_cubes`                                 | `c3peft_sort_cubes`                              | sort-cubes (`_no_top`) PEFT LoRA (15.54) |
+| `c3_sort_cubes_fast30m`                             | `c3_sort_cubes_fast30m`                          | sort-cubes (`_no_top`) 30m online run  |
+| `c2b_t2_sort_cubes_fast30m`                         | `c2b_t2_sort_cubes_fast30m`                      | sort-cubes (`_no_top`) Cosmos-2B T=2 fast |
+| `smolvla_sort_cubes_200k` / `smolvla_sort_cubes_100k` | `sort-cubes-smolvla-{200k-compiled,100k-exact}` | sort-cubes (`_no_top`) SmolVLA baselines |
 
 Action flow steps: checkpoints default to 10 Euler steps. For lower latency start the server with `--euler-steps 3` (explicit; record it in the test log).
 

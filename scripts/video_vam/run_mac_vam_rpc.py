@@ -1008,6 +1008,30 @@ def main(argv: list[str] | None = None) -> int:
             "/home/anton/lerobot-video-vam/outputs/train/v2-flux2-klein-online-aug-smolexpert",
             "video_vam",
         ),
+        "c3_sort_cubes_fast30m": (
+            "/home/anton/lerobot-video-vam/outputs/train/c3_sort_cubes_fast30m",
+            "video_vam",
+        ),
+        "c2b_t2_sort_cubes_fast30m": (
+            "/home/anton/lerobot-video-vam/outputs/train/c2b_t2_sort_cubes_fast30m",
+            "video_vam",
+        ),
+        "c3_sort_cubes_bs64": (
+            "/home/anton/lerobot-video-vam/outputs/train/sort-cubes-cosmos3-edge-optimized-bs64",
+            "video_vam",
+        ),
+        "c3peft_sort_cubes": (
+            "/home/anton/lerobot-video-vam/outputs/train/c3peft_sort_cubes",
+            "video_vam",
+        ),
+        "smolvla_sort_cubes_200k": (
+            "/home/anton/lerobot-video-vam/outputs/train/sort-cubes-smolvla-200k-compiled/checkpoints/190000/pretrained_model",
+            "smolvla",
+        ),
+        "smolvla_sort_cubes_100k": (
+            "/home/anton/lerobot-video-vam/outputs/train/sort-cubes-smolvla-100k-exact/checkpoints/last/pretrained_model",
+            "smolvla",
+        ),
     }
 
     if args.checkpoint in aliases:

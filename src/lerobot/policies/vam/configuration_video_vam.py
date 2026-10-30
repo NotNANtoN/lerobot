@@ -96,8 +96,21 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos_fp8_linear: bool = False
     cosmos_context_transform: str = "pool2"
     cosmos_lora_weights: Path | None = None
+    cosmos_lora_rank: int | None = None
+    cosmos_lora_alpha: float | None = None
     cosmos3_checkpoint: Path = Path("/home/anton/.cache/video-vam/cosmos3-edge")
     cosmos3_lora_weights: Path | None = None
+    cosmos3_lora_rank: int | None = None
+    cosmos3_lora_alpha: float | None = None
+    cosmos3_prompt: str = "take cube out of box"
+    flux2_lora_weights: Path | None = None
+    flux2_lora_rank: int | None = None
+    flux2_lora_alpha: float | None = None
+    flux2_tap_location: str | None = None
+    online_trained: bool = False
+    online_backbone: str | None = None
+    augmented: bool = False
+    train_stride: int | None = None
     jepa_world_model_checkpoint: Path | None = None
     jepa_planning_mode: str = "none"
     jepa_num_candidates: int = 8
@@ -132,6 +145,8 @@ class VideoVAMConfig(PreTrainedConfig):
             self.cosmos3_checkpoint = Path(self.cosmos3_checkpoint)
         if self.cosmos3_lora_weights is not None:
             self.cosmos3_lora_weights = Path(self.cosmos3_lora_weights)
+        if self.flux2_lora_weights is not None:
+            self.flux2_lora_weights = Path(self.flux2_lora_weights)
         if self.jepa_world_model_checkpoint is not None:
             self.jepa_world_model_checkpoint = Path(self.jepa_world_model_checkpoint)
         if self.jepa_planning_mode not in {"none", "best_of_n", "mppi"}:

@@ -1,0 +1,18 @@
+# Cosmos-Predict2-2B T=2 fast-inference online on Orellius/so101_sort_cubes_no_top (~30 min budget, 1000 steps, 3 Euler steps).
+#! include: _smolexpert_online_base
+#! include: _sort_cubes
+--online-backbone cosmos2b
+--backbone-checkpoint /home/anton/.cache/video-vam/mimic-video-f2833903/video_backbone/v2w_pretrained_cosmos.pt
+--backbone-tokenizer /home/anton/.cache/video-vam/mimic-video-f2833903/video_backbone/tokenizer/tokenizer.pth
+--backbone-prompt-embedding /home/anton/.cache/video-vam/prompt-embeddings/cube-out-of-box-t5-11b.safetensors
+--backbone-lora-weights outputs/train/cosmos2b-t2-direct-distilled-lora/best_lora.safetensors
+--backbone-layer 20
+--high-noise-sigma 80.0
+--dataset-revision a7c156de0e84a81e19457e6d783e4316e9f901e1
+--no-augment
+--lr 3e-4
+--warmup-steps 100
+--min-steps 600
+--max-steps 1000
+--val-every 500
+--num-steps 3

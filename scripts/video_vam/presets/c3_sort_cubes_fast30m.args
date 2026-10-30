@@ -1,0 +1,16 @@
+# Cosmos 3 Edge online on Orellius/so101_sort_cubes_no_top (~30 min budget, 1500 steps, 3 Euler steps).
+#! include: _smolexpert_online_base
+#! include: _sort_cubes
+--online-backbone cosmos3_edge
+--backbone-checkpoint /home/anton/.cache/video-vam/cosmos3-edge
+--backbone-lora-weights outputs/train/cosmos3-edge-sort-cubes-peft-lora/best_adapter
+--backbone-layer 20
+--backbone-prompt 'Grab the purple cube and put it into the cardboard box, ignore the other objects'
+--dataset-revision a7c156de0e84a81e19457e6d783e4316e9f901e1
+--no-augment
+--lr 3e-4
+--warmup-steps 150
+--min-steps 1000
+--max-steps 1500
+--val-every 500
+--num-steps 3
