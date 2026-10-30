@@ -217,12 +217,24 @@ class VideoVAMConfig(PreTrainedConfig):
         inference = getattr(rollout_config, "inference", None)
         if getattr(inference, "type", None) != "rtc":
             raise ValueError("Video-VAM rollout requires inference.type=rtc")
+        if getattr(inference, "observation_history_size", None) == 1:
+            inference.observation_history_size = 5
         if getattr(inference, "observation_history_size", None) != 5:
             raise ValueError("Video-VAM rollout requires inference.observation_history_size=5")
         robot_config = getattr(rollout_config, "robot", None)
         if getattr(robot_config, "use_degrees", None) is not True:
             raise ValueError("Video-VAM SO-101 rollout requires robot.use_degrees=true")
         relative = getattr(robot_config, "max_relative_target", None)
+        if relative is None and robot_config is not None:
+            relative = {
+                "shoulder_pan": 45.0,
+                "shoulder_lift": 45.0,
+                "elbow_flex": 45.0,
+                "wrist_flex": 45.0,
+                "wrist_roll": 45.0,
+                "gripper": 50.0,
+            }
+            robot_config.max_relative_target = relative
         if not isinstance(relative, dict):
             raise ValueError(
                 "Video-VAM rollout requires robot.max_relative_target as a complete per-motor dictionary; "
