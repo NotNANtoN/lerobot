@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812

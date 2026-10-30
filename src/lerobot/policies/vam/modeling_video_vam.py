@@ -140,8 +140,13 @@ class VideoVAMPolicy(PreTrainedPolicy):
             input_channels=input_channels,
         ).eval()
         should_compile = getattr(config, "cosmos_torch_compile", False)
-        if should_compile and str(config.device).startswith("cuda") and hasattr(torch, "compile"):
-            self.decoder._vector_field = torch.compile(self.decoder._vector_field, mode="max-autotune")
+        if (
+            should_compile
+            and str(config.device).startswith("cuda")
+            and hasattr(torch, "compile")
+            and config.backend != "cosmos3_edge"
+        ):
+            self.decoder._vector_field = torch.compile(self.decoder._vector_field, mode="default")
         self.extractor, self.prompt_embedding = self._build_extractor()
         if config.jepa_world_model_checkpoint is not None and config.jepa_planning_mode != "none":
             from safetensors.torch import load_file

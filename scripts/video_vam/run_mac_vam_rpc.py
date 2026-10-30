@@ -42,6 +42,7 @@ import ast
 import base64
 import json
 import math
+import os
 import shlex
 import shutil
 import subprocess
@@ -58,7 +59,7 @@ from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.latency_tracker import LatencyTracker
 
-SSH_HOST = "abakus"
+SSH_HOST = os.environ.get("VAM_SSH_HOST", "runpod-vam")
 
 
 def _ssh_executable() -> str:
@@ -844,6 +845,7 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global SSH_HOST
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -857,7 +859,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Model alias ('cosmos3_lora', 'cosmos2b_t2_distilled', 'smolvla_v2') or path (default 'cosmos3_lora')",
     )
     parser.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help=f"RPC port on abakus (default {DEFAULT_PORT})"
+        "--remote-host",
+        default=SSH_HOST,
+        help="SSH host alias for the GPU server (default: runpod-vam or $VAM_SSH_HOST)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"RPC port on remote host (default {DEFAULT_PORT})"
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
@@ -939,6 +946,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--feature-seed", type=int, default=0)
     args = parser.parse_args(argv)
+    SSH_HOST = args.remote_host
     if args.fps != 10:
         parser.error("These checkpoints require 10 Hz observation/action cadence")
     if not 1 <= args.port <= 65535 or args.execution_horizon < 1 or args.prefetch_steps < 1:

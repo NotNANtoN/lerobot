@@ -9,11 +9,14 @@ import hashlib
 import io
 import json
 import math
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 import torch
 from PIL import Image
@@ -183,6 +186,7 @@ class RPCApplication:
             elif config.joint_limits_min is None or config.joint_limits_max is None:
                 config.joint_limits_min = [-180.0, -180.0, -180.0, -180.0, -180.0, 0.0]
                 config.joint_limits_max = [180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
+            config.joint_limit_tolerance = max(getattr(config, "joint_limit_tolerance", 0.0), 15.0)
             self.backend = VideoVAMPolicy.from_pretrained(args.checkpoint, config=config)
             self.policy = self.backend
             self.horizon = 30
