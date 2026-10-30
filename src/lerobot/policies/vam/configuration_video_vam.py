@@ -133,7 +133,7 @@ class VideoVAMConfig(PreTrainedConfig):
     joint_limits_max: list[float] | None = field(
         default_factory=lambda: [180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
     )
-    joint_limit_tolerance: float = 15.0
+    joint_limit_tolerance: float = 60.0
 
     rtc_config: RTCConfig | None = None
 
@@ -222,6 +222,12 @@ class VideoVAMConfig(PreTrainedConfig):
                 inference.observation_history_size = 5
             if getattr(inference, "observation_history_size", None) != 5:
                 raise ValueError("Video-VAM rollout requires inference.observation_history_size=5")
+            rtc_cfg = getattr(inference, "rtc", None)
+            if rtc_cfg is not None and getattr(rtc_cfg, "max_guidance_weight", 10.0) > 3.0:
+                rtc_cfg.max_guidance_weight = 3.0
+            exec_h = int(getattr(rtc_cfg, "execution_horizon", 15)) if rtc_cfg is not None else 15
+            if getattr(inference, "queue_threshold", 30) >= self.chunk_size:
+                inference.queue_threshold = min(exec_h, self.chunk_size - 10)
         robot_config = getattr(rollout_config, "robot", None)
         if robot_config is not None and getattr(robot_config, "use_degrees", None) is not True:
             robot_config.use_degrees = True

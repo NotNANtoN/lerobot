@@ -93,6 +93,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
         super().__init__(config)
         self._action_queue: deque[Tensor] = deque()
         self._frame_history: deque[Tensor] = deque(maxlen=5)
+        self._auto_frame_index: int = 0
         self.rtc_processor: RTCProcessor | None = None
         self._closed = False
         self._ltx_context_transform: str | None = None
@@ -329,8 +330,13 @@ class VideoVAMPolicy(PreTrainedPolicy):
             return getattr(self.config, "feature_seed_global", 0)
         frame = batch.get(HISTORY_FRAME_INDEX_KEY)
         if not isinstance(frame, Tensor) or frame.numel() != 1:
-            raise ValueError(f"batch must contain scalar {HISTORY_FRAME_INDEX_KEY}")
-        frame_index = self.config.feature_seed_frame_offset + int(frame.item())
+            if self.config.backend == "cosmos3_edge":
+                return getattr(self.config, "feature_seed_global", 0)
+            frame_val = self._auto_frame_index
+            self._auto_frame_index += 1
+        else:
+            frame_val = int(frame.item())
+        frame_index = self.config.feature_seed_frame_offset + frame_val
         if self.config.backend == "cosmos":
             from .cosmos_feature_cache import derive_window_seed
         else:
@@ -529,6 +535,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         self._action_queue.clear()
         self._frame_history.clear()
+        self._auto_frame_index = 0
         if self.rtc_processor is not None:
             self.rtc_processor.reset_tracker()
 
