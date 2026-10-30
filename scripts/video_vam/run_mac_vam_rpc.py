@@ -1074,7 +1074,6 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         if not args.robot_port:
             import glob
-            from pathlib import Path
 
             if Path(DEFAULT_PORT_PATH).exists():
                 args.robot_port = DEFAULT_PORT_PATH
