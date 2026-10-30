@@ -374,13 +374,13 @@ class VideoVAMRPCClient:
         *,
         policy: str,
         port: int = DEFAULT_PORT,
-        ssh_host: str = SSH_HOST,
+        ssh_host: str | None = None,
         timeout: float = 120.0,
         health: dict[str, Any] | None = None,
     ) -> None:
         if policy not in {"smolvla", "video_vam"}:
             raise ValueError("policy must be smolvla or video_vam")
-        self.policy, self.port, self.ssh_host = policy, port, ssh_host
+        self.policy, self.port, self.ssh_host = policy, port, (SSH_HOST if ssh_host is None else ssh_host)
         self.timeout, self.health = timeout, health or {}
         self.frames: deque[Any] = deque(maxlen=5 if policy == "video_vam" else 1)
         self.frame_times: deque[float] = deque(maxlen=self.frames.maxlen)
@@ -1120,7 +1120,11 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise RuntimeError("Server advertises incompatible or missing action metadata")
         client = VideoVAMRPCClient(
-            policy=args.policy, port=args.port, timeout=args.rpc_timeout, health=health
+            policy=args.policy,
+            port=args.port,
+            ssh_host=SSH_HOST,
+            timeout=args.rpc_timeout,
+            health=health,
         )
         if args.dry_run:
             _run_dry(args, client)
