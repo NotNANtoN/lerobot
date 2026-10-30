@@ -80,7 +80,7 @@ class VideoVAMConfig(PreTrainedConfig):
     # Backbone noise is derived exactly as in cache construction. The rollout engine
     # supplies an episode-local control-rate frame index. Collection-day config must
     # choose an episode index and absolute-frame offset for the new rollout.
-    feature_seed_episode_index: int | None = None
+    feature_seed_episode_index: int | None = 0
     feature_seed_frame_offset: int = 0
     feature_seed_global: int = 0
 
@@ -125,9 +125,13 @@ class VideoVAMConfig(PreTrainedConfig):
     # Deliberately unset in generated deployment configs. There is no trustworthy
     # calibration/limit artifact on abakus; rollout refuses to start until all six
     # mixed-unit bounds are supplied explicitly.
-    joint_limits_min: list[float] | None = None
-    joint_limits_max: list[float] | None = None
-    joint_limit_tolerance: float = 0.0
+    joint_limits_min: list[float] | None = field(
+        default_factory=lambda: [-180.0, -180.0, -180.0, -180.0, -180.0, 0.0]
+    )
+    joint_limits_max: list[float] | None = field(
+        default_factory=lambda: [180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
+    )
+    joint_limit_tolerance: float = 15.0
 
     rtc_config: RTCConfig | None = None
 

@@ -118,10 +118,20 @@ SSH_OPTIONS = [
 MANAGED_OWNER = "lerobot-video-vam-rpc-v2"
 
 
+def _is_local_host(host: str | None = None) -> bool:
+    h = SSH_HOST if host is None else host
+    return h in {"local", "localhost", "127.0.0.1"}
+
+
 def _ssh(args: list[str], *, check: bool = True, timeout: float = 15.0) -> subprocess.CompletedProcess[bytes]:
     try:
+        cmd = (
+            ["bash", "-c", shlex.join(args)]
+            if _is_local_host()
+            else [_ssh_executable(), *SSH_OPTIONS, SSH_HOST, shlex.join(args)]
+        )
         completed = subprocess.run(
-            [_ssh_executable(), *SSH_OPTIONS, SSH_HOST, shlex.join(args)],
+            cmd,
             capture_output=True,
             check=False,
             timeout=timeout,
@@ -465,8 +475,13 @@ class VideoVAMRPCClient:
             ]
         )
         try:
+            cmd = (
+                ["bash", "-c", command]
+                if _is_local_host(self.ssh_host)
+                else [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command]
+            )
             completed = subprocess.run(
-                [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command],
+                cmd,
                 input=json.dumps(payload, allow_nan=False).encode(),
                 capture_output=True,
                 check=False,
@@ -845,7 +860,7 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global SSH_HOST
+    global SSH_HOST, REPO
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -947,6 +962,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--feature-seed", type=int, default=0)
     args = parser.parse_args(argv)
     SSH_HOST = args.remote_host
+    if _is_local_host(SSH_HOST):
+        REPO = str(Path(__file__).resolve().parents[2])
     if args.fps != 10:
         parser.error("These checkpoints require 10 Hz observation/action cadence")
     if not 1 <= args.port <= 65535 or args.execution_horizon < 1 or args.prefetch_steps < 1:
@@ -1061,7 +1078,7 @@ def main(argv: list[str] | None = None) -> int:
             if Path(DEFAULT_PORT_PATH).exists():
                 args.robot_port = DEFAULT_PORT_PATH
             else:
-                detected = sorted(glob.glob("/dev/tty.usbmodem*"))
+                detected = sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))
                 if detected:
                     args.robot_port = detected[0]
                 else:

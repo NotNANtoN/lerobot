@@ -167,9 +167,14 @@ class VideoVAMPolicy(PreTrainedPolicy):
     ) -> VideoVAMPolicy:
         # The run best.safetensors is the decoder custom artifact, not a wrapper
         # model.safetensors. Build the wrapper and let the decoder load it strictly.
+        local_path = Path(pretrained_name_or_path)
+        if not local_path.exists():
+            from huggingface_hub import snapshot_download
+
+            local_path = Path(snapshot_download(str(pretrained_name_or_path)))
         if config is None:
-            config = VideoVAMConfig.from_pretrained(pretrained_name_or_path)
-        config.pretrained_path = Path(pretrained_name_or_path)
+            config = VideoVAMConfig.from_pretrained(local_path)
+        config.pretrained_path = local_path
         for ignored in ("revision", "strict", "local_files_only"):
             kwargs.pop(ignored, None)
         if kwargs:

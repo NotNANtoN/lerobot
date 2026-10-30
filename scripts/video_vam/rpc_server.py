@@ -74,9 +74,46 @@ def validate_chunk(value: Any, *, horizon: int, name: str = "action_chunk") -> t
     return tensor
 
 
+HF_FALLBACK_REPOS = {
+    "c3_sort_cubes_fast30m": "Orellius/so101_sort_cubes_no_top_cosmos3_edge_smolexpert",
+    "c2b_t2_sort_cubes_fast30m": "Orellius/so101_sort_cubes_no_top_cosmos2b_t2_smolexpert",
+    "pretrained_model": "Orellius/so101_sort_cubes_no_top_smolvla_base_100k",
+}
+
+
+def _ensure_local_checkpoint(raw_path: Path) -> Path:
+    expanded = raw_path.expanduser()
+    if expanded.exists():
+        return expanded.resolve(strict=True)
+    # Remap /home/anton/lerobot-video-vam/... to current repo root if running on another machine
+    repo_root = Path(__file__).resolve().parents[2]
+    s = str(raw_path)
+    if "/lerobot-video-vam/" in s:
+        rel = s.split("/lerobot-video-vam/", 1)[1]
+        candidate = repo_root / rel
+        if candidate.exists():
+            return candidate.resolve(strict=True)
+        expanded = candidate
+    hf_repo = None
+    if "/" in s and not s.startswith("/") and len(s.split("/")) == 2:
+        hf_repo = s
+        expanded = repo_root / "outputs/train" / s.split("/")[1]
+    elif "sort-cubes-smolvla-100k-exact" in s:
+        hf_repo = "Orellius/so101_sort_cubes_no_top_smolvla_base_100k"
+    elif expanded.name in HF_FALLBACK_REPOS:
+        hf_repo = HF_FALLBACK_REPOS[expanded.name]
+    if hf_repo is not None:
+        from huggingface_hub import snapshot_download
+
+        expanded.mkdir(parents=True, exist_ok=True)
+        snapshot_download(hf_repo, local_dir=str(expanded))
+        return expanded.resolve(strict=True)
+    return expanded.resolve(strict=True)
+
+
 def checkpoint_identity(args: argparse.Namespace) -> dict[str, Any]:
     """Content-address local checkpoint artifacts; never infer identity from a missing config."""
-    checkpoint = args.checkpoint.expanduser().resolve(strict=True)
+    checkpoint = _ensure_local_checkpoint(args.checkpoint)
     config_path = checkpoint / "config.json"
     config = json.loads(config_path.read_text())
     if not isinstance(config, dict) or config.get("type") != args.policy:

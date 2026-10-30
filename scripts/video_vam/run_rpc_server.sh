@@ -3,9 +3,14 @@
 # Concurrent inference is allowed: intentionally do not acquire the training GPU lock.
 set -euo pipefail
 
-REPO=/home/anton/lerobot-video-vam
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$REPO"
-source scripts/video_vam/cosmos_cuda_env.sh
+export TORCHINDUCTOR_COMPILE_THREADS=1
+export PYTHONPATH="${REPO}:${REPO}/src${PYTHONPATH:+:${PYTHONPATH}}"
+VAM_VENV="${VAM_VENV:-${REPO}/.venv}"
+if [[ -f scripts/video_vam/cosmos_cuda_env.sh ]]; then
+    source scripts/video_vam/cosmos_cuda_env.sh 2>/dev/null || true
+fi
 
 DEFAULT_SMOLVLA_CHECKPOINT="$REPO/outputs/train/cube_out_of_box_il_smolvla_train_only_stats_0_31_20260826_1hr/checkpoints/029200/pretrained_model"
 DEFAULT_PORT=8766

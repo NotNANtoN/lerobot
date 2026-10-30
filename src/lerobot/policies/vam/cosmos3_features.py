@@ -419,6 +419,15 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         self._torch_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
 
         # 1. Initialize or assign Transformer
+        if config.checkpoint_path is not None and not Path(config.checkpoint_path).exists():
+            fallback_dir = Path.home() / ".cache/video-vam/cosmos3-edge"
+            if not (fallback_dir / "transformer").is_dir():
+                from huggingface_hub import snapshot_download
+
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                snapshot_download("nvidia/Cosmos3-Edge", local_dir=str(fallback_dir))
+            config.checkpoint_path = fallback_dir
+            self.config.checkpoint_path = fallback_dir
         if transformer is not None:
             self.transformer = transformer.to(device=self.device, dtype=self._torch_dtype)
         elif config.checkpoint_path is not None:
