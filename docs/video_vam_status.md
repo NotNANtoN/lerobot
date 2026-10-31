@@ -1,7 +1,14 @@
 # Video-VAM status
 
-**Last updated:** 2026-10-18. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
+**Last updated:** 2026-10-31. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
 Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is authoritative.
+
+## 0a. Todo List with Nemo (2026-10-31)
+
+- [ ] **Build simulation for our SO-101 task**: Create a simulation environment matching our exact physical SO-101 setup (`sort-cubes` / `cube-out-of-box`), ideally using an LLM to reconstruct the exact scene, camera pose, and task geometry.
+- [ ] **Standardized validation loss tracking across all runs**: Track validation flow-matching loss + action RMSE (`Full-30`, `First-5`, `H1`, `Arm`, `Gripper`) during training for every run, strictly evaluated on the exact same held-out episode split across all trainings (`68:77` for `sort-cubes`, `32:40` for `cube_out_of_box v1`).
+- [ ] **Validation loss vs. physical picking correlation**: Systematically test whether lower validation loss / first-5 RMSE correlates with actual physical picking & sorting success rate on the robot.
+- [ ] **LoRA / DoRA on Cosmos for faster training & larger batch sizes**: Explore PEFT LoRA / DoRA directly on Cosmos (and quantized / pruned backbones) to increase effective batch size and training throughput.
 
 ## 0. Goals (stated by Anton, 2026-09-24)
 

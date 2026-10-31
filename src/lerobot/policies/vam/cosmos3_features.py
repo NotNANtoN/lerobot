@@ -659,11 +659,12 @@ def tap_cosmos3_layers(
 
     def make_hook(block_idx: int, layer_num: int):
         def hook_fn(module: nn.Module, inputs: Any, outputs: Any) -> None:
+            keep_grad = torch.is_grad_enabled()
             if isinstance(outputs, tuple) and len(outputs) >= 2:
                 _, g_out = outputs[0], outputs[1]
-                captured[layer_num] = g_out.detach().unsqueeze(0)
+                captured[layer_num] = (g_out if keep_grad else g_out.detach()).unsqueeze(0)
             elif isinstance(outputs, Tensor):
-                captured[layer_num] = outputs.detach().unsqueeze(0)
+                captured[layer_num] = (outputs if keep_grad else outputs.detach()).unsqueeze(0)
             if early_exit and block_idx == max_block_idx:
                 raise Cosmos3EarlyExitException("Reached target layer")
 
@@ -718,6 +719,10 @@ class Cosmos3ExtractorConfig(BaseExtractorConfig):
     lora_checkpoint: str | Path | None = None
     lora_rank: int = 16
     lora_alpha: float = 32.0
+    trainable_lora: bool = False
+    lora_use_dora: bool = False
+    lora_pathway: str = "gen_only"
+    gradient_checkpointing: bool = False
     compile_dit: bool = False
     compile_vae: bool = False
     dit_compile_mode: str = "default"
@@ -779,7 +784,11 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         for p in self.transformer.parameters():
             p.requires_grad_(False)
 
-        # 2. Load LoRA if requested
+        # 2. Load or inject LoRA/DoRA if requested
+        max_layer = max(self.config.hidden_layers)
+        if loaded_transformer_from_disk and hasattr(self.transformer, "layers") and len(self.transformer.layers) > max_layer:
+            self.transformer.layers = self.transformer.layers[:max_layer]
+
         if config.lora_checkpoint is not None:
             from lerobot.policies.vam.cosmos3_lora import (
                 is_peft_adapter,
@@ -798,7 +807,39 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                     config.lora_checkpoint,
                     rank=config.lora_rank,
                     alpha=config.lora_alpha,
+                    block_indices=range(len(self.transformer.layers)),
+                    use_dora=config.lora_use_dora if config.trainable_lora else None,
                 )
+        elif config.trainable_lora:
+            from lerobot.policies.vam.cosmos3_lora import (
+                DUAL_PATHWAY_TARGET_MODULES,
+                GEN_TARGET_MODULES,
+                UND_TARGET_MODULES,
+                inject_cosmos3_lora,
+            )
+
+            if config.lora_pathway == "gen_only":
+                target_mods = GEN_TARGET_MODULES
+            elif config.lora_pathway == "und_only":
+                target_mods = UND_TARGET_MODULES
+            else:
+                target_mods = DUAL_PATHWAY_TARGET_MODULES
+            inject_cosmos3_lora(
+                self.transformer,
+                rank=config.lora_rank,
+                alpha=config.lora_alpha,
+                block_indices=range(len(self.transformer.layers)),
+                target_modules=target_mods,
+                use_dora=config.lora_use_dora,
+            )
+
+        if not config.trainable_lora:
+            for p in self.transformer.parameters():
+                p.requires_grad_(False)
+        else:
+            from lerobot.policies.vam.cosmos_lora import freeze_base_parameters
+
+            freeze_base_parameters(self.transformer)
 
         # 3. Initialize text prompt embedding cache (before moving/pruning embed_tokens)
         self.prompt_text = config.prompt
@@ -809,9 +850,6 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         self._init_prompt_tokens()
 
         if loaded_transformer_from_disk:
-            max_layer = max(self.config.hidden_layers)
-            if hasattr(self.transformer, "layers") and len(self.transformer.layers) > max_layer:
-                self.transformer.layers = self.transformer.layers[:max_layer]
             for unused_attr in ("lm_head", "proj_out", "time_embedder", "action_proj_in", "action_proj_out"):
                 if hasattr(self.transformer, unused_attr):
                     setattr(self.transformer, unused_attr, None)
@@ -819,7 +857,13 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             if embed_tokens_cpu is not None:
                 self.transformer.embed_tokens = None
             self.transformer = self.transformer.to(device=self.device, dtype=self._torch_dtype)
-            self._precompute_and_prune_und_pathway()
+            if config.trainable_lora:
+                for name, p in self.transformer.named_parameters():
+                    if name.endswith(("lora_A", "lora_B", "dora_magnitude")):
+                        p.data = p.data.float()
+                        p.requires_grad_(True)
+            if not (config.trainable_lora and config.lora_pathway in ("dual", "und_only")):
+                self._precompute_and_prune_und_pathway()
             if embed_tokens_cpu is not None:
                 self.transformer.embed_tokens = embed_tokens_cpu.to(device="cpu", dtype=self._torch_dtype)
 
@@ -917,7 +961,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             q_u = attn.norm_q(attn.to_q(u_norm).view(-1, attn.num_attention_heads, attn.head_dim))
             k_u = attn.norm_k(attn.to_k(u_norm).view(-1, attn.num_key_value_heads, attn.head_dim))
             v_u = attn.to_v(u_norm).view(-1, attn.num_key_value_heads, attn.head_dim)
-            k_u_gen = attn.k_norm_und_for_gen(k_u) if attn.k_norm_und_for_gen is not None else k_u
+            k_norm_und = getattr(attn, "k_norm_und_for_gen", None)
+            k_u_gen = k_norm_und(k_u) if k_norm_und is not None else k_u
             q_u = q_u * cos_u + _rotate_half(q_u) * sin_u
             k_u = k_u * cos_u + _rotate_half(k_u) * sin_u
             k_u_gen = k_u_gen * cos_u + _rotate_half(k_u_gen) * sin_u
@@ -995,6 +1040,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
     def compile_transformer(self, mode: str = "default") -> None:
         """Compile targeted transformer layers with PyTorch Inductor kernel fusion."""
+        if self.device.type != "cuda":
+            return
         max_block = max(lyr - 1 for lyr in self.config.hidden_layers)
         for i in range(max_block + 1):
             if i < len(self.transformer.layers):
@@ -1002,6 +1049,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
     def compile_vae(self, mode: str = "reduce-overhead") -> None:
         """Compile VAE encoder with PyTorch Inductor CUDA Graphs."""
+        if self.device.type != "cuda":
+            return
         if self.vae is not None and hasattr(self.vae, "encoder"):
             self.vae.encoder = torch.compile(self.vae.encoder, mode=mode)
 
@@ -1025,7 +1074,7 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
         if (
             self._supports_fast_batched_gen()
-            and self._cached_und_kv is not None
+            and (self._cached_und_kv is not None or (self.config.trainable_lora and self._cached_prompt_embeds is not None))
             and text_conditioning is None
         ):
             packed_latent, grid_shape = patchify_and_pack_cosmos3_vision_latents(
@@ -1033,15 +1082,26 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             )
             g = self.transformer.proj_in(packed_latent.to(dtype=self._torch_dtype, device=self.device))
             b_cur = g.shape[0]
-            num_text_tokens = self._cached_und_kv[0][0].shape[1]
+            und_kv = (
+                self._cached_und_kv
+                if self._cached_und_kv is not None
+                else self._compute_und_kv_for_embeds.__wrapped__(self, self._cached_prompt_embeds)  # type: ignore[arg-type]
+            )
+            num_text_tokens = und_kv[0][0].shape[1]
             cos_g, sin_g = self._get_gen_rotary(num_text_tokens, grid_shape)
             max_block_idx = max(lyr - 1 for lyr in self.config.hidden_layers)
             target_set = set(self.config.hidden_layers)
             captured: dict[int, Tensor] = {}
-            for idx in range(min(max_block_idx + 1, len(self.transformer.layers))):
-                blk = self.transformer.layers[idx]
-                k_u_g, v_u_g = self._cached_und_kv[idx]
-                g_norm = blk.input_layernorm_moe_gen(g)
+            keep_grad = torch.is_grad_enabled()
+            use_ckpt = bool(self.config.gradient_checkpointing and keep_grad)
+
+            def _gen_block_forward(
+                blk: nn.Module,
+                g_in: Tensor,
+                k_u_g: Tensor,
+                v_u_g: Tensor,
+            ) -> Tensor:
+                g_norm = blk.input_layernorm_moe_gen(g_in)
                 attn = blk.self_attn
                 q_raw = attn.add_q_proj(g_norm).view(b_cur, -1, attn.num_attention_heads, attn.head_dim)
                 k_raw = attn.add_k_proj(g_norm).view(b_cur, -1, attn.num_key_value_heads, attn.head_dim)
@@ -1053,11 +1113,21 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 f_out = dispatch_attention_fn(
                     q_g, all_k, all_v, is_causal=False, enable_gqa=True
                 ).flatten(-2, -1)
-                res_g = g + attn.to_add_out(f_out)
-                g = res_g + blk.mlp_moe_gen(blk.post_attention_layernorm_moe_gen(res_g))
+                res_g = g_in + attn.to_add_out(f_out)
+                return res_g + blk.mlp_moe_gen(blk.post_attention_layernorm_moe_gen(res_g))
+
+            for idx in range(min(max_block_idx + 1, len(self.transformer.layers))):
+                blk = self.transformer.layers[idx]
+                k_u_g, v_u_g = und_kv[idx]
+                if use_ckpt:
+                    g = torch.utils.checkpoint.checkpoint(
+                        _gen_block_forward, blk, g, k_u_g, v_u_g, use_reentrant=False
+                    )
+                else:
+                    g = _gen_block_forward(blk, g, k_u_g, v_u_g)
                 lyr_num = idx + 1
                 if lyr_num in target_set:
-                    captured[lyr_num] = g.detach()
+                    captured[lyr_num] = g if keep_grad else g.detach()
             return captured
 
         if latents.shape[0] > 1:

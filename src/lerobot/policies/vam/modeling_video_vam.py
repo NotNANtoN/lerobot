@@ -280,6 +280,15 @@ class VideoVAMPolicy(PreTrainedPolicy):
         elif self.config.backend == "cosmos3_edge":
             from .cosmos3_features import Cosmos3ExtractorConfig, Cosmos3FeatureExtractor
 
+            run_dir = Path(self.config.pretrained_path) if self.config.pretrained_path is not None else None
+            lora_ckpt = self.config.cosmos3_lora_weights
+            if lora_ckpt is not None and not Path(lora_ckpt).exists() and run_dir is not None:
+                candidate = run_dir / Path(lora_ckpt).name
+                if candidate.exists():
+                    lora_ckpt = candidate
+            elif lora_ckpt is None and run_dir is not None and (run_dir / "best_backbone_lora.safetensors").is_file():
+                lora_ckpt = run_dir / "best_backbone_lora.safetensors"
+
             extractor = Cosmos3FeatureExtractor(
                 Cosmos3ExtractorConfig(
                     backbone_name="cosmos3-edge",
@@ -289,7 +298,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     dtype="bfloat16",
                     fps=10.0,
                     prompt=getattr(self.config, "cosmos3_prompt", "take cube out of box"),
-                    lora_checkpoint=self.config.cosmos3_lora_weights,
+                    lora_checkpoint=lora_ckpt,
                     compile_dit=False,
                     compile_vae=False,
                 )

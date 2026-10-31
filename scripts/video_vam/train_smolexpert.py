@@ -1588,6 +1588,8 @@ def clean_own_artifacts(output_dir: Path) -> None:
     own_filenames = {
         "best.safetensors",
         "last.safetensors",
+        "best_backbone_lora.safetensors",
+        "last_backbone_lora.safetensors",
         "run_manifest.json",
         "normalizer.safetensors",
         "normalizer.json",
@@ -1664,6 +1666,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="LoRA alpha for online backbone. Default: read from the adapter's metadata/sidecar; "
         "an explicit value must match it.",
+    )
+    parser.add_argument(
+        "--train-backbone-lora",
+        action="store_true",
+        help="Enable joint end-to-end LoRA/DoRA training of the online Cosmos 3 backbone alongside SmolExpert.",
+    )
+    parser.add_argument(
+        "--backbone-lora-dora",
+        "--dora",
+        dest="backbone_lora_dora",
+        action="store_true",
+        help="Use DoRA (Weight-Decomposed Low-Rank Adaptation) when training Cosmos 3 backbone adapters.",
+    )
+    parser.add_argument(
+        "--backbone-lora-lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for trainable online backbone LoRA/DoRA adapters (default: 1e-4).",
+    )
+    parser.add_argument(
+        "--backbone-lora-pathway",
+        type=str,
+        choices=("gen_only", "dual", "und_only"),
+        default="gen_only",
+        help="Target pathway for trainable Cosmos 3 LoRA/DoRA: 'gen_only' (visual DiT blocks, fastest), 'dual', or 'und_only'.",
+    )
+    parser.add_argument(
+        "--backbone-grad-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use activation checkpointing across Cosmos 3 blocks when --train-backbone-lora is enabled (default: True).",
     )
     parser.add_argument(
         "--backbone-layer",
@@ -2747,6 +2780,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             ckpt_dir = args.backbone_checkpoint or Path("/home/anton/.cache/video-vam/cosmos3-edge")
+            train_bb_lora = bool(getattr(args, "train_backbone_lora", False))
             b_cfg = Cosmos3ExtractorConfig(
                 backbone_name="cosmos3-edge",
                 checkpoint_path=ckpt_dir,
@@ -2759,18 +2793,28 @@ def main(argv: list[str] | None = None) -> int:
                 lora_checkpoint=args.backbone_lora_weights,
                 lora_rank=args.backbone_lora_rank,
                 lora_alpha=args.backbone_lora_alpha,
-                compile_dit=True,
+                trainable_lora=train_bb_lora,
+                lora_use_dora=bool(getattr(args, "backbone_lora_dora", False)),
+                lora_pathway=getattr(args, "backbone_lora_pathway", "gen_only"),
+                gradient_checkpointing=bool(getattr(args, "backbone_grad_checkpointing", True)) and train_bb_lora,
+                compile_dit=not train_bb_lora,
                 compile_vae=True,
                 vae_compile_mode="default",
             )
+            adapter_mode_str = (
+                f"trainable {'DoRA' if b_cfg.lora_use_dora else 'LoRA'} ({b_cfg.lora_pathway}, r={b_cfg.lora_rank}, alpha={b_cfg.lora_alpha})"
+                if train_bb_lora
+                else f"frozen (lora: {args.backbone_lora_weights})"
+            )
             print(
-                f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, lora: {args.backbone_lora_weights})..."
+                f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, {adapter_mode_str})..."
             )
             backbone_extractor = Cosmos3FeatureExtractor(b_cfg)
             backbone_extractor._smolexpert_eval_identity = cosmos3_identity
             backbone_extractor.eval()
-            for p in backbone_extractor.parameters():
-                p.requires_grad_(False)
+            if not train_bb_lora:
+                for p in backbone_extractor.parameters():
+                    p.requires_grad_(False)
         elif any(k in b_key for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
             from types import SimpleNamespace
 
@@ -2969,9 +3013,23 @@ def main(argv: list[str] | None = None) -> int:
             input_channels=input_channels,
         )
 
-    trainable_params = [p for p in decoder.parameters() if p.requires_grad]
+    decoder_trainable_params = [p for p in decoder.parameters() if p.requires_grad]
+    backbone_trainable_params = (
+        [p for p in backbone_extractor.parameters() if p.requires_grad]
+        if (backbone_extractor is not None and getattr(args, "train_backbone_lora", False))
+        else []
+    )
+    trainable_params = decoder_trainable_params + backbone_trainable_params
     total_params = sum(p.numel() for p in trainable_params)
-    print(f"Trainable parameters: {total_params:,}")
+    if backbone_trainable_params:
+        bb_params = sum(p.numel() for p in backbone_trainable_params)
+        dec_params = sum(p.numel() for p in decoder_trainable_params)
+        print(
+            f"Trainable parameters: {total_params:,} (SmolExpert: {dec_params:,}, "
+            f"Backbone {'DoRA' if getattr(args, 'backbone_lora_dora', False) else 'LoRA'}: {bb_params:,})"
+        )
+    else:
+        print(f"Trainable parameters: {total_params:,}")
 
     if not args.eval_only and args.model_checkpoint and args.model_checkpoint.is_file():
         print(f"Warm-starting SmolExpert weights from {args.model_checkpoint}...")
@@ -3051,13 +3109,26 @@ def main(argv: list[str] | None = None) -> int:
     atomic_write_json(args.output_dir / "run_manifest.json", run_manifest)
 
     # 6. Optimizer & Scheduler
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-    )
+    if backbone_trainable_params:
+        param_groups: list[dict[str, Any]] = [
+            {"params": decoder_trainable_params, "lr": args.lr},
+            {"params": backbone_trainable_params, "lr": getattr(args, "backbone_lora_lr", args.lr)},
+        ]
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
     scheduler = build_scheduler(
         optimizer,
         scheduler_type=args.lr_scheduler,
@@ -3153,8 +3224,9 @@ def main(argv: list[str] | None = None) -> int:
                     contexts = torch.randn(len(batch_items), num_tokens, input_channels, device=device)
                 else:
                     assert backbone_extractor is not None
+                    train_bb = bool(backbone_trainable_params)
                     ram_cache: dict[str, Tensor] = getattr(backbone_extractor, "_online_ram_cache", {})
-                    if not args.augment and all(item.sample_id in ram_cache for item in batch_items):
+                    if not train_bb and not args.augment and all(item.sample_id in ram_cache for item in batch_items):
                         contexts = torch.stack([ram_cache[item.sample_id] for item in batch_items]).to(
                             device=device
                         )
@@ -3172,29 +3244,38 @@ def main(argv: list[str] | None = None) -> int:
                         else:
                             rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
 
-                        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                            if hasattr(backbone_extractor, "encode_latents") and hasattr(
-                                backbone_extractor, "forward_transformer_blocks"
-                            ):
+                        if train_bb and hasattr(backbone_extractor, "encode_latents") and hasattr(
+                            backbone_extractor, "forward_transformer_blocks"
+                        ):
+                            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                                 latents_batch = backbone_extractor.encode_latents(rgb_in)
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                                 tapped = backbone_extractor.forward_transformer_blocks(latents_batch)
                                 contexts = tapped[args.backbone_layer].to(device=device)
-                            else:
-                                extracted_list = []
-                                for b_i in range(rgb_in.shape[0]):
-                                    out_f = backbone_extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
-                                    extracted_list.append(out_f.features)
-                                contexts = torch.cat(extracted_list, dim=0).to(device=device)
-                            if (
-                                not args.augment
-                                and not getattr(backbone_extractor, "_ram_cache_full", False)
-                                and len(ram_cache) < 4096
-                            ):
-                                if len(ram_cache) % 128 == 0 and OnlineVideoDataset._get_available_ram_bytes() < 14 * (1024**3):
-                                    backbone_extractor._ram_cache_full = True
+                        else:
+                            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                if hasattr(backbone_extractor, "encode_latents") and hasattr(
+                                    backbone_extractor, "forward_transformer_blocks"
+                                ):
+                                    latents_batch = backbone_extractor.encode_latents(rgb_in)
+                                    tapped = backbone_extractor.forward_transformer_blocks(latents_batch)
+                                    contexts = tapped[args.backbone_layer].to(device=device)
                                 else:
-                                    for b_item, ctx_t in zip(batch_items, contexts, strict=False):
-                                        ram_cache[b_item.sample_id] = ctx_t.detach().cpu()
+                                    extracted_list = []
+                                    for b_i in range(rgb_in.shape[0]):
+                                        out_f = backbone_extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
+                                        extracted_list.append(out_f.features)
+                                    contexts = torch.cat(extracted_list, dim=0).to(device=device)
+                                if (
+                                    not args.augment
+                                    and not getattr(backbone_extractor, "_ram_cache_full", False)
+                                    and len(ram_cache) < 4096
+                                ):
+                                    if len(ram_cache) % 128 == 0 and OnlineVideoDataset._get_available_ram_bytes() < 14 * (1024**3):
+                                        backbone_extractor._ram_cache_full = True
+                                    else:
+                                        for b_item, ctx_t in zip(batch_items, contexts, strict=False):
+                                            ram_cache[b_item.sample_id] = ctx_t.detach().cpu()
             else:
                 contexts = torch.stack([item.context for item in batch_items]).to(device=device)
             action_is_pad = torch.stack([item.action_is_pad for item in batch_items]).to(
@@ -3218,13 +3299,23 @@ def main(argv: list[str] | None = None) -> int:
             accum_loss += float(loss.item()) / args.grad_accum_steps
 
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
 
         optimizer.step()
         scheduler.step()
         opt_step += 1
         if args.save_last_every > 0 and opt_step % args.save_last_every == 0:
             save_weights_artifact(args.output_dir, "last", decoder.state_dict(), opt_step, run_manifest)
+            if backbone_trainable_params and hasattr(backbone_extractor, "transformer"):
+                from lerobot.policies.vam.cosmos3_lora import save_cosmos3_lora
+
+                save_cosmos3_lora(
+                    backbone_extractor.transformer,
+                    args.output_dir / "last_backbone_lora.safetensors",
+                    rank=args.backbone_lora_rank,
+                    alpha=args.backbone_lora_alpha,
+                    use_dora=bool(getattr(args, "backbone_lora_dora", False)),
+                )
 
         log_interval = 20 if is_online else max(1, args.val_every // 5)
         if opt_step % log_interval == 0 or opt_step == args.max_steps:
@@ -3337,6 +3428,16 @@ def main(argv: list[str] | None = None) -> int:
                 save_weights_artifact(
                     args.output_dir, "best", decoder.state_dict(), opt_step, run_manifest, metric=rmse
                 )
+                if backbone_trainable_params and hasattr(backbone_extractor, "transformer"):
+                    from lerobot.policies.vam.cosmos3_lora import save_cosmos3_lora
+
+                    save_cosmos3_lora(
+                        backbone_extractor.transformer,
+                        args.output_dir / "best_backbone_lora.safetensors",
+                        rank=args.backbone_lora_rank,
+                        alpha=args.backbone_lora_alpha,
+                        use_dora=bool(getattr(args, "backbone_lora_dora", False)),
+                    )
                 best_meta = {
                     "step": opt_step,
                     "val_rmse": rmse,
@@ -3383,12 +3484,33 @@ def main(argv: list[str] | None = None) -> int:
 
     # Save live final weights before loading best for final evaluation.
     save_weights_artifact(args.output_dir, "last", decoder.state_dict(), opt_step, run_manifest)
+    if backbone_trainable_params and hasattr(backbone_extractor, "transformer"):
+        from lerobot.policies.vam.cosmos3_lora import save_cosmos3_lora
+
+        save_cosmos3_lora(
+            backbone_extractor.transformer,
+            args.output_dir / "last_backbone_lora.safetensors",
+            rank=args.backbone_lora_rank,
+            alpha=args.backbone_lora_alpha,
+            use_dora=bool(getattr(args, "backbone_lora_dora", False)),
+        )
 
     # Final evaluation of best checkpoint on both Eval-1 and Eval-2
     if best_checkpoint_path.is_file():
         print("Loading best checkpoint for final dual evaluation...")
         best_state = load_file(str(best_checkpoint_path))
         decoder.load_state_dict(best_state)
+        best_bb_lora_path = args.output_dir / "best_backbone_lora.safetensors"
+        if backbone_trainable_params and best_bb_lora_path.is_file() and hasattr(backbone_extractor, "transformer"):
+            from lerobot.policies.vam.cosmos3_lora import load_cosmos3_lora
+
+            load_cosmos3_lora(
+                backbone_extractor.transformer,
+                best_bb_lora_path,
+                rank=args.backbone_lora_rank,
+                alpha=args.backbone_lora_alpha,
+                use_dora=bool(getattr(args, "backbone_lora_dora", False)),
+            )
 
     final_eval1 = evaluate_validation(
         decoder,

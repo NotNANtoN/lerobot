@@ -66,8 +66,9 @@ def inject_cosmos3_lora(
     alpha: float = 32.0,
     block_indices: Sequence[int] | None = None,
     target_modules: Sequence[str] | None = None,
+    use_dora: bool = False,
 ) -> list[str]:
-    """Wrap attention and MLP projections in selected Cosmos 3 layers with LoRALinear.
+    """Wrap attention and MLP projections in selected Cosmos 3 layers with LoRALinear (LoRA or DoRA).
 
     Supports dual-pathway fine-tuning covering both the understanding pathway (:
     , , , , , , )
@@ -101,7 +102,7 @@ def inject_cosmos3_lora(
             parent = layer.get_submodule(parent_name) if parent_name else layer
             if isinstance(getattr(parent, attr), LoRALinear):
                 continue
-            lora_mod = LoRALinear(module, rank=rank, alpha=alpha)
+            lora_mod = LoRALinear(module, rank=rank, alpha=alpha, use_dora=use_dora)
             setattr(parent, attr, lora_mod)
             wrapped.append(f"layers.{i}.{name}")
 
@@ -115,9 +116,9 @@ def cosmos3_lora_state_dict(transformer: nn.Module) -> dict[str, torch.Tensor]:
     """Extract adapter-only state dict with clean keys."""
     state: dict[str, torch.Tensor] = {}
     for name, param in transformer.named_parameters():
-        if not name.endswith(("lora_A", "lora_B")):
+        if not name.endswith(("lora_A", "lora_B", "dora_magnitude")):
             continue
-        clean_name = name.replace("._checkpoint_wrapped_module.", ".")
+        clean_name = name.replace("._checkpoint_wrapped_module.", ".").replace("._orig_mod.", ".")
         state[clean_name] = param.detach().cpu().contiguous()
     if not state:
         raise ValueError("No LoRA parameters found in transformer")
@@ -132,26 +133,31 @@ def save_cosmos3_lora(
     alpha: float | None = None,
     block_indices: Sequence[int] | None = None,
     target_modules: Sequence[str] | None = None,
+    use_dora: bool | None = None,
 ) -> None:
-    """Save adapter parameters as safetensors with rank/alpha/module metadata."""
+    """Save adapter parameters as safetensors with rank/alpha/module/dora metadata."""
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     state = cosmos3_lora_state_dict(transformer)
 
-    # Infer rank / alpha if not passed
+    # Infer rank / alpha / use_dora if not passed
     resolved_rank = rank
     resolved_alpha = alpha
+    resolved_dora = use_dora
     for m in transformer.modules():
         if isinstance(m, LoRALinear):
             if resolved_rank is None:
                 resolved_rank = m.rank
             if resolved_alpha is None:
                 resolved_alpha = m.alpha
+            if resolved_dora is None:
+                resolved_dora = m.use_dora
             break
 
     metadata: dict[str, str] = {
         "rank": str(resolved_rank if resolved_rank is not None else 16),
         "alpha": str(resolved_alpha if resolved_alpha is not None else 32.0),
+        "use_dora": str(bool(resolved_dora)).lower(),
     }
     if block_indices is not None:
         metadata["block_indices"] = ",".join(map(str, sorted(block_indices)))
@@ -184,8 +190,9 @@ def cosmos3_lora_config(
     alpha: float,
     target_modules: Sequence[str] = DUAL_PATHWAY_TARGET_MODULES,
     block_indices: Sequence[int] | None = None,
+    use_dora: bool = False,
 ) -> LoraConfig:
-    """PEFT LoraConfig equivalent to ``inject_cosmos3_lora(rank, alpha, block_indices, target_modules)``."""
+    """PEFT LoraConfig equivalent to ``inject_cosmos3_lora(rank, alpha, block_indices, target_modules, use_dora)``."""
     require_package("peft", extra="peft")
     return LoraConfig(
         r=rank,
@@ -194,6 +201,7 @@ def cosmos3_lora_config(
         bias="none",
         target_modules=cosmos3_peft_target_regex(target_modules, block_indices),
         init_lora_weights=True,
+        use_dora=use_dora,
     )
 
 
@@ -280,11 +288,12 @@ def load_cosmos3_lora(
     alpha: float = 32.0,
     block_indices: Sequence[int] | None = None,
     target_modules: Sequence[str] | None = None,
+    use_dora: bool | None = None,
 ) -> None:
-    """Inject LoRA if not present and load state dict from file with strict scope validation.
+    """Inject LoRA/DoRA if not present and load state dict from file with strict scope validation.
 
     Fails early if path does not exist.
-    Fails if any expected LoRA parameter within the target scope is missing from state_dict.
+    Fails if any expected LoRA/DoRA parameter within the target scope is missing from state_dict.
     """
     file_path = Path(path)
     if not file_path.is_file():
@@ -312,6 +321,14 @@ def load_cosmos3_lora(
 
     state_dict = load_file(str(file_path))
 
+    has_dora_keys = any(k.endswith(".dora_magnitude") for k in state_dict)
+    if use_dora is not None:
+        loaded_dora = use_dora
+    elif "use_dora" in saved_metadata:
+        loaded_dora = saved_metadata["use_dora"].lower() in ("true", "1", "yes")
+    else:
+        loaded_dora = has_dora_keys
+
     # Discover layers and target modules in state_dict
     layer_indices = set()
     detected_modules = set()
@@ -332,7 +349,7 @@ def load_cosmos3_lora(
         else (sorted(detected_modules) if detected_modules else None)
     )
 
-    # Ensure LoRA is injected
+    # Ensure LoRA/DoRA is injected
     if not any(isinstance(m, LoRALinear) for m in transformer.modules()):
         inject_cosmos3_lora(
             transformer,
@@ -340,11 +357,14 @@ def load_cosmos3_lora(
             alpha=loaded_alpha,
             block_indices=target_indices,
             target_modules=target_mods,
+            use_dora=loaded_dora,
         )
 
-    # Strict check: all active LoRA parameters must be present in state_dict
+    # Strict check: all active LoRA/DoRA parameters must be present in state_dict
     active_lora_params = {
-        name: param for name, param in transformer.named_parameters() if name.endswith(("lora_A", "lora_B"))
+        name.replace("._orig_mod.", "."): param
+        for name, param in transformer.named_parameters()
+        if name.endswith(("lora_A", "lora_B", "dora_magnitude"))
     }
     missing_keys = [name for name in active_lora_params if name not in state_dict]
     if missing_keys:

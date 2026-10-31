@@ -40,9 +40,16 @@ class CosmosLoRAError(RuntimeError):
 
 
 class LoRALinear(nn.Module):
-    """A frozen linear layer with a fp32 low-rank residual."""
+    """A frozen linear layer with a fp32 low-rank residual and optional DoRA magnitude decomposition."""
 
-    def __init__(self, base_layer: nn.Linear, rank: int, alpha: float | None = None) -> None:
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        rank: int,
+        alpha: float | None = None,
+        *,
+        use_dora: bool = False,
+    ) -> None:
         super().__init__()
         if not isinstance(base_layer, nn.Linear):
             raise TypeError("LoRALinear base_layer must be torch.nn.Linear")
@@ -56,6 +63,7 @@ class LoRALinear(nn.Module):
         self.rank = rank
         self.alpha = float(alpha)
         self.scaling = self.alpha / rank
+        self.use_dora = bool(use_dora)
         adapter_device = base_layer.weight.device
         self.lora_A = nn.Parameter(
             torch.empty(rank, base_layer.in_features, device=adapter_device, dtype=torch.float32)
@@ -64,6 +72,12 @@ class LoRALinear(nn.Module):
             torch.zeros(base_layer.out_features, rank, device=adapter_device, dtype=torch.float32)
         )
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        if self.use_dora:
+            with torch.no_grad():
+                init_mag = torch.linalg.vector_norm(base_layer.weight.detach().float(), dim=1)
+            self.dora_magnitude = nn.Parameter(init_mag.to(device=adapter_device, dtype=torch.float32))
+        else:
+            self.register_parameter("dora_magnitude", None)
         for parameter in self.base_layer.parameters():
             parameter.requires_grad_(False)
 
@@ -84,9 +98,19 @@ class LoRALinear(nn.Module):
         return self.base_layer.out_features
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        result = self.base_layer(input)
-        update = functional.linear(functional.linear(input.float(), self.lora_A), self.lora_B)
-        return result + (update * self.scaling).to(dtype=result.dtype)
+        lora_delta = functional.linear(functional.linear(input.float(), self.lora_A), self.lora_B) * self.scaling
+        if not self.use_dora or self.dora_magnitude is None:
+            result = self.base_layer(input)
+            return result + lora_delta.to(dtype=result.dtype)
+        base_no_bias = functional.linear(input, self.base_layer.weight, None)
+        combined = base_no_bias.float() + lora_delta
+        adapted_weight = self.base_layer.weight.float() + (self.lora_B @ self.lora_A) * self.scaling
+        weight_norm = torch.linalg.vector_norm(adapted_weight, dim=1).clamp_min(1e-8)
+        mag_scale = self.dora_magnitude / weight_norm
+        out = (combined * mag_scale).to(dtype=base_no_bias.dtype)
+        if self.base_layer.bias is not None:
+            out = out + self.base_layer.bias
+        return out
 
 
 def _is_lora_target(name: str, module: nn.Module) -> bool:
@@ -223,15 +247,16 @@ def merge_lora_file_into_base(model: nn.Module, lora_path: str | Path) -> dict[s
 
 
 def freeze_base_parameters(model: nn.Module) -> None:
-    """Freeze every parameter except LoRA A/B tensors."""
+    """Freeze every parameter except LoRA A/B and DoRA magnitude tensors."""
     for name, parameter in model.named_parameters():
-        parameter.requires_grad_(name.endswith("lora_A") or name.endswith("lora_B"))
+        parameter.requires_grad_(name.endswith(("lora_A", "lora_B", "dora_magnitude")))
 
 
 def merge_lora_into_base(model: nn.Module) -> tuple[str, ...]:
-    """Fuse every LoRALinear residual into its base Linear in place.
+    """Fuse every LoRALinear residual (and optional DoRA magnitude) into its base Linear in place.
 
     For each wrapped projection this computes ``W + (alpha / rank) * B @ A``
+    (rescaled by ``dora_magnitude / ||W'||_2`` when DoRA is enabled)
     in the base weight dtype, replaces the wrapper with a plain ``nn.Linear``,
     and freezes the resulting layer for inference.
     """
@@ -244,7 +269,11 @@ def merge_lora_into_base(model: nn.Module) -> tuple[str, ...]:
         for name, module in candidates:
             base_layer = module.base_layer
             update = (module.lora_B @ module.lora_A) * (module.alpha / module.rank)
-            fused_weight = base_layer.weight + update.to(
+            adapted_fp32 = base_layer.weight.float() + update
+            if module.use_dora and module.dora_magnitude is not None:
+                weight_norm = torch.linalg.vector_norm(adapted_fp32, dim=1, keepdim=True).clamp_min(1e-8)
+                adapted_fp32 = adapted_fp32 * (module.dora_magnitude.unsqueeze(1) / weight_norm)
+            fused_weight = adapted_fp32.to(
                 device=base_layer.weight.device, dtype=base_layer.weight.dtype
             )
             fused_layer = nn.Linear(
@@ -268,9 +297,11 @@ def merge_lora_into_base(model: nn.Module) -> tuple[str, ...]:
 
 
 def lora_parameters(model: nn.Module) -> list[nn.Parameter]:
-    """Return trainable LoRA parameters in stable module order."""
+    """Return trainable LoRA/DoRA parameters in stable module order."""
     parameters = [
-        parameter for name, parameter in model.named_parameters() if name.endswith(("lora_A", "lora_B"))
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.endswith(("lora_A", "lora_B", "dora_magnitude"))
     ]
     if not parameters:
         raise ValueError("model has no LoRA parameters")

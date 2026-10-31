@@ -92,6 +92,13 @@ def parse_args() -> argparse.Namespace:
         choices=["dual", "gen_only", "und_only"],
         help="LoRA pathway targets: dual (gen_seq + und_seq), gen_only, or und_only",
     )
+    parser.add_argument(
+        "--use-dora",
+        "--dora",
+        dest="use_dora",
+        action="store_true",
+        help="Use DoRA (Weight-Decomposed Low-Rank Adaptation) instead of standard LoRA.",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--val-every", type=int, default=500)
@@ -346,7 +353,12 @@ def main() -> int:
 
         for p in pipe.transformer.parameters():
             p.requires_grad_(False)
-        lora_config = cosmos3_lora_config(rank=args.rank, alpha=args.alpha, target_modules=targets)
+        lora_config = cosmos3_lora_config(
+            rank=args.rank,
+            alpha=args.alpha,
+            target_modules=targets,
+            use_dora=args.use_dora,
+        )
         # fp32 adapter weights on the bf16 base (autocast_adapter_dtype), as with LoRALinear.
         model = get_peft_model(pipe.transformer, lora_config)
         # get_peft_model overwrites this from the (unset) model name; record the real base.
@@ -359,13 +371,15 @@ def main() -> int:
             alpha=args.alpha,
             block_indices=range(len(pipe.transformer.layers)),
             target_modules=targets,
+            use_dora=args.use_dora,
         )
         model = pipe.transformer
         num_wrapped = len(wrapped_layers)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     num_trainable = sum(p.numel() for p in trainable_params)
+    adapter_label = "DoRA" if args.use_dora else "LoRA"
     print(
-        f"LoRA ({args.adapter_format}) injected into {num_wrapped} linear modules "
+        f"{adapter_label} ({args.adapter_format}) injected into {num_wrapped} linear modules "
         f"({num_trainable / 1e6:.2f}M trainable parameters)."
     )
     model.train()
@@ -525,6 +539,7 @@ def main() -> int:
                         rank=args.rank,
                         alpha=args.alpha,
                         target_modules=targets,
+                        use_dora=args.use_dora,
                     )
                 provenance_info = {
                     "step": step,
@@ -545,6 +560,7 @@ def main() -> int:
                     "lora": {
                         "rank": args.rank,
                         "alpha": args.alpha,
+                        "use_dora": bool(args.use_dora),
                         "pathway": args.pathway,
                         "num_trainable": num_trainable,
                         "lr": args.lr,

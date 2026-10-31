@@ -222,3 +222,120 @@ def test_load_cosmos3_lora_strict_missing_keys_check() -> None:
 
         with pytest.raises(RuntimeError, match="Missing.*required LoRA keys"):
             load_cosmos3_lora(transformer2, save_path, block_indices=[0, 1, 2, 3])
+
+
+def test_inject_and_save_load_cosmos3_dora(tmp_path: Path) -> None:
+    """Verify DoRA injection, zero-init parity, gradient flow to dora_magnitude, save/load, and merge parity."""
+    from lerobot.policies.vam.cosmos_lora import merge_lora_into_base
+
+    torch.manual_seed(7)
+    transformer = build_tiny_real_cosmos3_transformer(num_layers=2)
+    base_state = {k: v.clone() for k, v in transformer.state_dict().items()}
+    und = torch.randn(4, 64)
+    gen = torch.randn(6, 64)
+    rotary = (torch.ones(4, 16), torch.zeros(4, 16), torch.ones(6, 16), torch.zeros(6, 16))
+
+    with torch.no_grad():
+        u_base, g_base = transformer.layers[0](und, gen, rotary)
+
+    wrapped = inject_cosmos3_lora(
+        transformer, rank=4, alpha=8.0, target_modules=GEN_TARGET_MODULES, use_dora=True
+    )
+    assert len(wrapped) == 14
+
+    # Zero-init parity: with B=0 and dora_magnitude = ||W_0||_2, output matches base identically
+    with torch.no_grad():
+        u_dora_init, g_dora_init = transformer.layers[0](und, gen, rotary)
+    torch.testing.assert_close(u_base, u_dora_init, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(g_base, g_dora_init, atol=1e-6, rtol=1e-6)
+
+    # Check backward pass populates gradients on lora_A, lora_B, and dora_magnitude
+    _, g_out = transformer.layers[0](und, gen, rotary)
+    # Perturb B slightly so dora_magnitude and lora_A also get non-zero gradients
+    with torch.no_grad():
+        for name, p in transformer.named_parameters():
+            if name.endswith("lora_B"):
+                p.normal_(std=0.05)
+    _, g_out = transformer.layers[0](und, gen, rotary)
+    loss = g_out.square().mean()
+    loss.backward()
+
+    layer0_params = dict(transformer.layers[0].named_parameters())
+    assert layer0_params["self_attn.add_q_proj.lora_A"].grad is not None
+    assert layer0_params["self_attn.add_q_proj.lora_B"].grad is not None
+    assert layer0_params["self_attn.add_q_proj.dora_magnitude"].grad is not None
+
+    # Save & reload DoRA checkpoint
+    dora_file = tmp_path / "dora.safetensors"
+    save_cosmos3_lora(transformer, dora_file, rank=4, alpha=8.0, use_dora=True)
+
+    with safetensors.safe_open(str(dora_file), framework="pt") as f:
+        meta = f.metadata()
+        assert meta is not None and meta.get("use_dora") == "true"
+
+    fresh = build_tiny_real_cosmos3_transformer(num_layers=2)
+    fresh.load_state_dict(base_state)
+    load_cosmos3_lora(fresh, dora_file)
+
+    with torch.no_grad():
+        _, g_expected = transformer.layers[0](und, gen, rotary)
+        _, g_loaded = fresh.layers[0](und, gen, rotary)
+    torch.testing.assert_close(g_expected, g_loaded, atol=1e-6, rtol=1e-6)
+
+    # Merge DoRA into base Linear and verify exact output parity
+    merge_lora_into_base(fresh)
+    with torch.no_grad():
+        _, g_merged = fresh.layers[0](und, gen, rotary)
+    torch.testing.assert_close(g_expected, g_merged, atol=1e-5, rtol=1e-5)
+
+
+def test_cosmos3_extractor_trainable_lora_and_dora_gradient_flow() -> None:
+    """Verify Cosmos3FeatureExtractor with trainable_lora=True and lora_use_dora=True propagates gradients."""
+    from unittest.mock import MagicMock
+
+    from lerobot.policies.vam.cosmos3_features import Cosmos3ExtractorConfig, Cosmos3FeatureExtractor
+
+    torch.manual_seed(11)
+    transformer = build_tiny_real_cosmos3_transformer(num_layers=3, hidden_size=64)
+    tokenizer = MagicMock(return_value=type("Tokens", (), {"input_ids": [1, 2, 3]})())
+    cfg = Cosmos3ExtractorConfig(
+        backbone_name="cosmos3-edge",
+        hidden_layers=(2,),
+        device="cpu",
+        dtype="float32",
+        latent_patch_size=2,
+        hidden_dim=64,
+        num_layers=3,
+        fps=10.0,
+        lora_rank=4,
+        lora_alpha=8.0,
+        trainable_lora=True,
+        lora_use_dora=True,
+        lora_pathway="gen_only",
+        gradient_checkpointing=True,
+    )
+    extractor = Cosmos3FeatureExtractor(cfg, transformer=transformer, tokenizer=tokenizer)
+    # Precompute static und KV cache to exercise the fast batched gen pathway
+    extractor._precompute_and_prune_und_pathway()
+    for name, p in extractor.transformer.named_parameters():
+        if name.endswith("lora_B"):
+            with torch.no_grad():
+                p.normal_(std=0.05)
+
+    latents = torch.randn(2, 48, 2, 4, 4)
+    tapped = extractor.forward_transformer_blocks(latents)
+    feats = tapped[2]
+    assert feats.shape == (2, 8, 64)
+    assert feats.requires_grad
+
+    loss = feats.square().mean()
+    loss.backward()
+
+    grad_names = [
+        name
+        for name, p in extractor.transformer.named_parameters()
+        if p.requires_grad and p.grad is not None and p.grad.abs().sum().item() > 0
+    ]
+    assert any(n.endswith("lora_A") for n in grad_names)
+    assert any(n.endswith("lora_B") for n in grad_names)
+    assert any(n.endswith("dora_magnitude") for n in grad_names)
