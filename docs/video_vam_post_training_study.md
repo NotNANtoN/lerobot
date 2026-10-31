@@ -180,9 +180,15 @@ Because `SharedFeatureSequenceDetector` and `MultiFrameSuccessDetector` are **al
    - At $12\text{--}15\text{ seconds}$ per rollout plus ~20 seconds for human cube reset, **25 rollouts require ~15 minutes of physical robot time**, matching the 19.1-minute average reported by EXPO-FT (Dong et al., CoRL 2026).
    - If the zero-shot policy fails on all 5 attempts in a difficult corner spawn ($\bar{R}_g = 0$), provide **1–2 brief teleoperated or kinesthetic guided rollouts** (HG-DAgger style, as in EXPO-FT) for that spawn so $\bar{R}_g \in (0.15, 0.40)$ and $A_{g,\text{succ}} = 1 - \bar{R}_g \ge +0.60$.
 
-### 4.2 Complete 4-Stage Step-by-Step Runbook (Teleop $\to$ Fine-Tune $\to$ Reward Detector $\to$ Online RL)
+### 4.2 Complete 4-Stage Step-by-Step Runbook (Gradio Studio UI or CLI)
 
-All four stages are packaged as ready-to-run CLI commands in this repository:
+You can run the entire 4-stage pipeline interactively from the **Gradio Post-Training Studio** (with USB port scanning, live wrist-camera preview, detector gate inspection, and 1-click human reward override during the 6-second reset pause):
+
+```bash
+uv run --with gradio python scripts/video_vam/post_training_app.py
+```
+
+Or run each of the four stages directly via CLI commands:
 
 #### Stage 1 — Collect Demonstrations via Teleoperation (`~50–70` Episodes)
 ```bash
