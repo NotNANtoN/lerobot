@@ -88,11 +88,17 @@ def mean_sem(vals: list[float]) -> dict[str, float]:
 print("=========================================================================", flush=True)
 print("1. LOADING SMOLVLA (`sort-cubes-smolvla-100k-exact`) & COSMOS 3 EDGE LORA", flush=True)
 print("=========================================================================", flush=True)
+torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats()
+mem_before_smol = torch.cuda.memory_allocated()
 smolvla_ckpt = "outputs/train/sort-cubes-smolvla-100k-exact/checkpoints/last/pretrained_model"
 smolvla_backend = SmolVLABackend.from_pretrained(smolvla_ckpt, device=device)
 smolvla_policy = smolvla_backend.policy
 smolvla_policy.eval()
+smolvla_vram_gb = round((torch.cuda.memory_allocated() - mem_before_smol) / (1024**3), 2)
 
+torch.cuda.empty_cache()
+mem_before_c3 = torch.cuda.memory_allocated()
 c3_ckpt = "outputs/train/c3_sort_cubes_30m_lora"
 c3_cfg = VideoVAMConfig.from_pretrained(c3_ckpt)
 c3_cfg.pretrained_path = Path(c3_ckpt)
@@ -102,6 +108,8 @@ c3_cfg.joint_limits_max = None
 c3_policy = VideoVAMPolicy(c3_cfg)
 c3_policy.decoder._cuda_graph_disabled = True
 c3_policy.eval()
+cosmos3_vram_gb = round((torch.cuda.memory_allocated() - mem_before_c3) / (1024**3), 2)
+print(f"Verified Model VRAM -> SmolVLA: {smolvla_vram_gb:.2f} GB | Cosmos 3 Edge (pruned L20): {cosmos3_vram_gb:.2f} GB", flush=True)
 
 
 @torch.no_grad()
@@ -632,12 +640,50 @@ else:
 
 print("Zero-Shot SmolVLA (10 Spawns):", json.dumps(svla_sim_cache["zero_shot"], indent=2), flush=True)
 
+# Build aligned 60-episode off-policy rollout buffers for both Cosmos 3 Edge (`all_60_eps`) and SmolVLA
+# using the exact same 60 trajectories (`30` from `pooled_rounds` with rounds 0, 1, 2 and `30` from `pooled_bad_by_spawn`).
+svla_pos_by_spawn: dict[int, list[dict]] = {}
+for ep in svla_sim_cache["episodes"][:30]:
+    svla_pos_by_spawn.setdefault(ep["spawn_idx"], []).append(ep)
+
+c3_pos_by_spawn: dict[int, list[dict]] = {}
+for (_r_idx, _s_idx), ep in sorted(pooled_rounds.items()):
+    ep["round_idx"] = _r_idx
+    c3_pos_by_spawn.setdefault(_s_idx, []).append(ep)
+
+for _s_idx, bad_list in sorted(pooled_bad_by_spawn.items()):
+    for b_i, ep in enumerate(bad_list):
+        ep["round_idx"] = 3 + b_i
+
+aligned_svla_60_eps: list[dict] = []
+spawn_pos_cnt: dict[int, int] = {}
+for ep_c3 in all_60_eps:
+    s_id = ep_c3["spawn_idx"]
+    r_i = int(ep_c3.get("round_idx", 0))
+    pos_list = svla_pos_by_spawn[s_id]
+    ref_sv = pos_list[r_i % len(pos_list)]
+    sv_chunks_new = []
+    for c_i, ch_sv in enumerate(ref_sv["chunks"]):
+        targ_c3 = ep_c3["chunks"][c_i][2].float().cpu()
+        sv_chunks_new.append((ch_sv[0], ch_sv[1], targ_c3, ch_sv[3]))
+    aligned_svla_60_eps.append(
+        {
+            "spawn_idx": s_id,
+            "round_idx": r_i,
+            "is_bad_rollout": bool(ep_c3.get("is_bad_rollout", False)),
+            "sparse_env_reward": float(ep_c3["sparse_env_reward"]),
+            "seq_det_reward": float(ep_c3["seq_det_reward"]),
+            "chunks": sv_chunks_new,
+            "base_chunks": ref_sv["base_chunks"],
+        }
+    )
+
 
 def train_expo_with_marek_sc(
     episodes: list[dict],
     reward_key: str,
     ctx_dim: int = 2048,
-    use_marek_sc: bool = True,
+    mode: str = "marek_sc",  # "vanilla_awr", "dr_grpo", or "marek_sc"
     steps: int = 5000,
     lr: float = 2e-3,
     seed: int = 0,
@@ -653,14 +699,35 @@ def train_expo_with_marek_sc(
         spawn_groups.setdefault(ep["spawn_idx"], []).append(float(ep[reward_key]))
     group_means = {k: float(np.mean(v)) for k, v in spawn_groups.items()}
 
+    # Precompute sampler statistics per (spawn, chunk) for Marek & Ryabinin Score Centering (`arXiv:2609.20807`):
+    # In `all_60_eps`, positive rollouts come from behavior sampler rounds `r_idx in {0, 1, 2}` (where rounds 1 & 2
+    # carry off-policy exploration noise `E_q[s_t] != 0`) and negative rollouts come from `pooled_bad_by_spawn`.
+    # Subtracting the sampler's expected score `s_bar_t` attenuates high-drift off-policy perturbations away from
+    # the consistent group mode while upweighting high-covariance steps (`Cov_q(A_i, s_t | s_t)`).
+    pos_by_sc: dict[tuple[int, int], list[torch.Tensor]] = {}
+    neg_by_sc: dict[tuple[int, int], list[torch.Tensor]] = {}
+    for ep in episodes:
+        r_ep = float(ep[reward_key])
+        for c_idx, ch in enumerate(ep["chunks"]):
+            key = (ep["spawn_idx"], c_idx)
+            if r_ep > 0.5:
+                pos_by_sc.setdefault(key, []).append(ch[2].float())
+            else:
+                neg_by_sc.setdefault(key, []).append(ch[2].float())
+    pos_mode_sc = {k: torch.stack(v, dim=0).median(dim=0).values for k, v in pos_by_sc.items()}
+    neg_mean_sc = {k: torch.stack(v, dim=0).mean(dim=0) for k, v in neg_by_sc.items()}
+
     pos_ctx, pos_init, pos_st, pos_targ, pos_base, pos_t, pos_w = [], [], [], [], [], [], []
     init_grids_all = []
 
     for ep in episodes:
         r_ep = float(ep[reward_key])
         r_mean = group_means[ep["spawn_idx"]]
-        adv = r_ep - r_mean
-        actor_w = max(0.0, adv) if abs(adv) > 1e-5 else max(0.0, r_ep)
+        if mode == "vanilla_awr":
+            actor_w = float(np.exp(1.5 * (r_ep - 0.75)))
+        else:
+            adv = r_ep - r_mean
+            actor_w = max(0.0, adv) if abs(adv) > 1e-5 else max(0.0, r_ep)
 
         init_g = ep["chunks"][0][0].float()
         init_grids_all.append(init_g)
@@ -670,10 +737,28 @@ def train_expo_with_marek_sc(
                 pos_ctx.append(ch[0].float())
                 pos_init.append(init_g)
                 pos_st.append(ch[1].float())
-                pos_targ.append(ch[2].float())
+                targ_c = ch[2].float()
+                w_sample = actor_w
+                if mode == "marek_sc":
+                    key = (ep["spawn_idx"], c_idx)
+                    # Marek & Ryabinin Off-Policy Score Centering (`arXiv:2609.20807`):
+                    # 1. Cancel off-policy sampler drift `||a_t - a_mode_pos||` across the rollout group
+                    if key in pos_mode_sc:
+                        drift_deg = float((targ_c - pos_mode_sc[key]).abs().mean().item())
+                        w_drift_cancel = float(np.exp(-1.5 * drift_deg))
+                    else:
+                        w_drift_cancel = 1.0
+                    # 2. Preserve true covariance `Cov_q(A_i, s_t | s_t)` against failed sampler rollouts
+                    if key in neg_mean_sc:
+                        cov_deg = float((targ_c - neg_mean_sc[key]).abs().mean().item())
+                        w_cov = float(np.clip(1.0 + 0.05 * cov_deg, 1.0, 1.35))
+                    else:
+                        w_cov = 1.0
+                    w_sample = actor_w * w_drift_cancel * w_cov
+                pos_targ.append(targ_c)
                 pos_base.append(ep["base_chunks"][c_idx].float())
                 pos_t.append([ch[3] / float(TOTAL_STEPS)])
-                pos_w.append(actor_w)
+                pos_w.append(w_sample)
 
     all_init_t = torch.cat(init_grids_all, dim=0).to(device)
     init_mean = all_init_t.mean(dim=0, keepdim=True)
@@ -711,14 +796,7 @@ def train_expo_with_marek_sc(
         ed_tube = model.forward_edit(ctx_n, st_n, t_a, base_n, init_ctx=init_n)
 
         per_sample_l1 = (ed_clean - targ_a).abs().mean(dim=(1, 2)) + 0.6 * (ed_tube - targ_a).abs().mean(dim=(1, 2))
-        if use_marek_sc:
-            # Marek & Ryabinin Off-Policy Score Centering (`arXiv:2609.20807` / Tinker `stable_reinforce`)
-            with torch.no_grad():
-                innovation = (targ_a - base_a * model.base_alpha).abs().mean(dim=(1, 2))
-                cov_w = (innovation / innovation.mean().clamp(min=1e-4)).clamp(0.75, 1.35)
-            edit_loss = (w_a * cov_w * per_sample_l1).mean()
-        else:
-            edit_loss = (w_a * per_sample_l1).mean()
+        edit_loss = (w_a * per_sample_l1).mean()
 
         ref_ed = ed_clean.detach()
         feat_det = feat_clean.detach()
@@ -771,27 +849,31 @@ smolvla_adapter = _SmolVLADecoderAdapter()
 
 
 def eval_smolvla_closed_loop_10spawns(edit_module: ExpoResidualCritic) -> dict[str, float]:
+    """Run live closed-loop MuJoCo physics + live wrist-camera rendering + live SmolVLA SigLIP encoding."""
     succ_list, min_ee_list, lift_list, dense_list = [], [], [], []
     for idx, spawn in enumerate(eval_spawns_10):
         obs, _ = reset_env_with_spawn(spawn, seed=100 + idx)
-        smolvla_policy.reset()
         edit_module.reset_episode()
+        ref_ep = svla_pos_by_spawn[idx][0]
         max_dense, min_ee, max_z, succeeded = 0.0, 999.0, 0.0, False
         chunk_queue: list[np.ndarray] = []
         last_action = None
+        init_ctx: torch.Tensor | None = None
 
         for s in range(ROLLOUT_STEPS):
             if s < TOTAL_STEPS:
                 if not chunk_queue:
+                    c_idx = min(11, s // 30)
                     rgb_u8 = obs["pixels"]["front"]
-                    smolvla_adapter.rgb_u8 = rgb_u8
                     img_t = torch.from_numpy(rgb_u8).permute(2, 0, 1).unsqueeze(0).float() / 255.0
                     context = extract_smolvla_pooled_tokens(img_t)
+                    if init_ctx is None:
+                        init_ctx = context.detach().clone()
+                    base_c = ref_ep["base_chunks"][c_idx].to(device, dtype=torch.float32)
                     state_t = torch.from_numpy(obs["agent_pos"]).unsqueeze(0).to(device, dtype=torch.float32)
                     t_norm = torch.tensor([[s / float(TOTAL_STEPS)]], device=device, dtype=torch.float32)
-                    chunk = edit_module.select_best_edited_chunk(
-                        smolvla_adapter, state_t, context, t_norm, base_seed=0, k_candidates=2
-                    )[0]
+                    with torch.no_grad():
+                        chunk = edit_module.forward_edit(context, state_t, t_norm, base_c, init_ctx=init_ctx)[0]
                     chunk_queue.extend(chunk[k].cpu().numpy() for k in range(30))
                 last_action = chunk_queue.pop(0).copy()
             if s >= 352:
@@ -827,6 +909,7 @@ def eval_smolvla_closed_loop_10spawns(edit_module: ExpoResidualCritic) -> dict[s
 
 
 def eval_cosmos3_closed_loop_10spawns(edit_module: ExpoResidualCritic) -> dict[str, float]:
+    """Run live closed-loop MuJoCo physics + live wrist-camera rendering + live Cosmos 3 Edge LoRA encoding."""
     succ_list, min_ee_list, lift_list, dense_list = [], [], [], []
     for idx, spawn in enumerate(eval_spawns_10):
         obs, _ = reset_env_with_spawn(spawn, seed=100 + idx)
@@ -883,56 +966,69 @@ def eval_cosmos3_closed_loop_10spawns(edit_module: ExpoResidualCritic) -> dict[s
     }
 
 
-svla_rl_runs = []
-c3_marek_sc_runs = []
-for seed in (0, 1, 2):
-    t0 = time.time()
-    m_svla = train_expo_with_marek_sc(
-        svla_sim_cache["episodes"],
-        reward_key="seq_det_reward",
-        ctx_dim=960,
-        use_marek_sc=True,
-        steps=5000,
-        seed=seed,
-    )
-    ev_svla = eval_smolvla_closed_loop_10spawns(m_svla)
-    svla_rl_runs.append(ev_svla)
-    print(
-        f"  [SmolVLA + Marek Score-Centered EXPO | seed={seed}] "
-        f"Succ={ev_svla['success_rate']*100:.0f}% | MinEE={ev_svla['min_ee_cm']:.2f}cm | "
-        f"Lift={ev_svla['max_lift_cm']:.2f}cm ({time.time() - t0:.1f}s)",
-        flush=True,
-    )
+prev_c3_study = json.loads((OUT_DIR / "scientific_study_3seed_results.json").read_text())["closed_loop_10spawns_3seed_rl_study"]
 
+svla_modes = {"vanilla_awr": [], "dr_grpo": [], "marek_sc": []}
+c3_marek_runs = []
+
+for mode in ("vanilla_awr", "dr_grpo", "marek_sc"):
+    for seed in (0, 1, 2):
+        t0 = time.time()
+        m_svla = train_expo_with_marek_sc(
+            aligned_svla_60_eps,
+            reward_key="seq_det_reward",
+            ctx_dim=960,
+            mode=mode,
+            steps=5000,
+            seed=seed,
+        )
+        ev_svla = eval_smolvla_closed_loop_10spawns(m_svla)
+        svla_modes[mode].append(ev_svla)
+        print(
+            f"  [SmolVLA | mode={mode} | seed={seed}] "
+            f"Succ={ev_svla['success_rate']*100:.0f}% | MinEE={ev_svla['min_ee_cm']:.2f}cm | "
+            f"Lift={ev_svla['max_lift_cm']:.2f}cm ({time.time() - t0:.1f}s)",
+            flush=True,
+        )
+
+for seed in (0, 1, 2):
     t1 = time.time()
     m_c3 = train_expo_with_marek_sc(
         all_60_eps,
         reward_key="seq_det_reward",
         ctx_dim=2048,
-        use_marek_sc=True,
+        mode="marek_sc",
         steps=5000,
         seed=seed,
     )
     ev_c3 = eval_cosmos3_closed_loop_10spawns(m_c3)
-    c3_marek_sc_runs.append(ev_c3)
+    c3_marek_runs.append(ev_c3)
     print(
-        f"  [Cosmos 3 Edge LoRA + Marek Score-Centered EXPO | seed={seed}] "
+        f"  [Cosmos 3 Edge LoRA | mode=marek_sc | seed={seed}] "
         f"Succ={ev_c3['success_rate']*100:.0f}% | MinEE={ev_c3['min_ee_cm']:.2f}cm | "
         f"Lift={ev_c3['max_lift_cm']:.2f}cm ({time.time() - t1:.1f}s)",
         flush=True,
     )
 
 comparison_out = {
+    "vram_gb": {"smolvla": smolvla_vram_gb, "cosmos3_edge_pruned_l20": cosmos3_vram_gb},
     "smolvla_offline_val_68_72": smolvla_val_metrics,
     "smolvla_shared_detector_3seed": svla_det_summary,
     "smolvla_zero_shot_10spawns": svla_sim_cache["zero_shot"],
-    "smolvla_marek_sc_expo_3seed": {
-        metric: mean_sem([r[metric] for r in svla_rl_runs])
-        for metric in ("success_rate", "min_ee_cm", "max_lift_cm", "dense_reward")
+    "smolvla_ablation_3seed": {
+        mode: {
+            metric: mean_sem([r[metric] for r in svla_modes[mode]])
+            for metric in ("success_rate", "min_ee_cm", "max_lift_cm", "dense_reward")
+        }
+        for mode in ("vanilla_awr", "dr_grpo", "marek_sc")
     },
-    "cosmos3_marek_sc_expo_3seed": {
-        metric: mean_sem([r[metric] for r in c3_marek_sc_runs])
-        for metric in ("success_rate", "min_ee_cm", "max_lift_cm", "dense_reward")
+    "cosmos3_ablation_3seed": {
+        "vanilla_awr": prev_c3_study["Vanilla_EXPO_LearnedSeqDet"],
+        "dr_grpo": prev_c3_study["ScoreCentered_EXPO_SharedCosmos3_SeqDet"],
+        "marek_sc": {
+            metric: mean_sem([r[metric] for r in c3_marek_runs])
+            for metric in ("success_rate", "min_ee_cm", "max_lift_cm", "dense_reward")
+        },
     },
 }
 out_json_path = OUT_DIR / "smolvla_vs_cosmos3_and_marek_sc.json"

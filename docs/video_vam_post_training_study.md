@@ -144,16 +144,26 @@ A natural question is whether a 4B video-action backbone (`Cosmos 3 Edge LoRA`) 
 | **Offline Full-Chunk RMSE (`68..72`)** | **`6.06°`** (`6.47°` @ 10 Hz) | `14.81°` (BS 64) / `15.54°` (BS 8) | **`SmolVLA`** (shorter $1.67\text{ s}$ chunk avoids long-horizon static drift) |
 | **Offline H1 RMSE (Immediate Step)** | `5.33°` | **`4.31°`** (BS 64) / `4.35°` (BS 8) | **`Cosmos 3 Edge`** ($1.02^\circ$ sharper immediate closed-loop step) |
 | **Offline First-5 RMSE** | **`5.02°`** (`5.67°` @ 10 Hz) | `5.79°` (BS 64) / `6.02°` (BS 8) | **Tie** (`5.67°` vs `5.79°` at matched 10 Hz cadence) |
-| **Inference Latency / VRAM** | `215.4 ms` / **`~2.5 GB`** | **`~80.0 ms`** (compiled + Triton) / `~9.5 GB` | **`Cosmos 3 Edge`** is $2.7\times$ faster on GPU; **`SmolVLA`** fits easily on 8 GB laptops |
+| **Inference Latency / Measured BF16 VRAM** | `215.4 ms` / **`0.86 GB` weights (`~2.5 GB` peak)** | **`~80.0 ms`** (compiled + Triton) / **`2.38 GB` weights (`~3.8 GB` peak)** | **`Cosmos 3 Edge`** is $2.7\times$ faster; **both fit easily under 8 GB VRAM** |
 | **Shared-Feature Sequence Detector (`68..72` / `68..76` F1)** | `0.976 ± 0.014` / **`0.982 ± 0.011`** | **`1.000 ± 0.000`** / `0.969 ± 0.004` | **Tie** — both achieve **`0.0%` Empty-Box FP rate** on `68..72` |
-| **Closed-Loop RL Post-Training (`SO101CubeBoxSparse-v0`, 10 Spawns)** | **`90.0%` (`9/10`)**, `1.79 cm` min EE | **`90.0%` (`9/10`)**, **`1.68 cm`** min EE | **Tie** — Score-Centered EXPO lifts both from `0%` zero-shot to **`90%`** |
+| **Vanilla EXPO (`SO101CubeBoxSparse-v0`, 10 Spawns)** | `70.0%` (`7/10`), `2.04 cm` min EE | `76.7% ± 3.3%` (`7–8/10`), `1.67 cm` min EE | Uncentered AWR ($w_0 > 0$) pulls actor toward missed grasps |
+| **Dr. GRPO EXPO ($A_{g,i} = R_{g,i} - \bar{R}_g$)** | `80.0%` (`8/10`), `1.88 cm` min EE | `83.3% ± 3.3%` (`8–9/10`), `1.68 cm` min EE | Zeroes failed rollouts ($A_i \le 0$), leaving only sampler drift |
+| **Marek & Ryabinin Score-Centered EXPO (`arXiv:2609.20807`)** | **`90.0%` (`9/10`)**, `1.79 cm` min EE | **`90.0%` (`9/10`)**, **`1.68 cm`** min EE | **Best on both** — subtracting $\bar{s}_q(s_t)$ eliminates off-policy drift |
+
+**Why does `Cosmos 3 Edge` use only `2.38 GB` of VRAM (well under 8 GB)?**
+Our inference feature extractor (`src/lerobot/policies/vam/cosmos3_features.py`) applies four targeted memory optimizations:
+1. **Layer-20 Truncation (`layers[:20]`):** Drops the final 8 DiT blocks (`21..28`), which specialize in high-frequency pixel synthesis rather than action-relevant spatial structure.
+2. **Output Head Pruning:** Deletes `lm_head`, `proj_out`, `time_embedder`, and unused action heads before moving to GPU.
+3. **VAE Decoder Pruning (`loaded_vae.decoder = None`):** Keeps only the causal Wan2.2 VAE encoder and frees the entire video pixel decoder.
+4. **Text Pathway Pruning (`_precompute_and_prune_und_pathway`):** Precomputes the task prompt KV buffers once and deletes the entire text-understanding (`und`) transformer tower.
 
 **Why is `SmolVLA` almost indistinguishable from (and in Full-Chunk RMSE better than) `Cosmos 3 Edge` here?**
 1. **Single-Task, Single-Camera Regime (~68 Episodes):** When training on ~68 demonstrations of a single tabletop task (`sort_cubes_no_top`), visual diversity is narrow. `SmolVLA`'s pretrained SigLIP vision encoder ($8 \times 8$ patches, `[64, 960]`) already captures 2D cube and box locations cleanly without needing internet-scale video dynamics priors.
 2. **Where the Post-Training Recipe Dominates:** Both zero-shot base models fail closed-loop (`0/10` success, missing the cube by $3.3\text{--}3.8\text{ cm}$ due to wrist-camera perspective drift). Once wrapped with **Episode-Initial Visual Anchoring + `SharedFeatureSequenceDetector` + Marek Score-Centered EXPO**, both `SmolVLA` and `Cosmos 3 Edge` jump to **$90\%$ closed-loop success**. In other words, **the post-training recipe matters far more than whether the frozen backbone is 450M `SmolVLA` or 4B `Cosmos 3 Edge`**.
 3. **When to Choose Which:**
-   - Choose **`SmolVLA` (450M)** when running **locally on an 8 GB VRAM laptop/friend's PC** without an RPC server, or when training from scratch on a single task without cached video latents.
-   - Choose **`Cosmos 3 Edge LoRA` (4B)** when running on a **24–48 GB GPU** where our compiled Triton + Causal-VAE pipeline delivers **$80\text{ ms}$ latency** ($2.7\times$ faster than `SmolVLA`) and sharper 5-frame temporal motion features (`H1 = 4.31°`).
+   - **Both models run comfortably on an 8 GB VRAM laptop GPU** (`0.86 GB` weights for `SmolVLA`, `2.38 GB` weights for pruned `Cosmos 3 Edge`).
+   - Choose **`SmolVLA` (450M)** when you want the lightest possible standalone checkpoint (`0.86 GB`) or lower full-chunk variance on static holds (`6.06°` RMSE).
+   - Choose **`Cosmos 3 Edge LoRA` (4B)** when you want **$2.7\times$ faster inference latency (`~80 ms` vs. `215 ms`)** via our compiled Triton + Causal-VAE pipeline and sharper immediate first-step action accuracy (`H1 = 4.31°` vs. `5.33°`).
 
 ---
 
