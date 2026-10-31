@@ -798,6 +798,66 @@ class LiberoPlusEnv(LiberoEnv):
     is_libero_plus: bool = True
 
 
+@EnvConfig.register_subclass("so101_cube_box")
+@dataclass
+class SO101CubeBoxEnvConfig(EnvConfig):
+    """MuJoCo digital-twin environment for SO-101 wrist-only 'Cube to Cardboard Box' task."""
+
+    task: str | None = "Grab the purple cube and put it into the cardboard box, ignore the other objects"
+    fps: int = 30
+    episode_length: int = 600
+    obs_type: str = "pixels_agent_pos"
+    observation_height: int = 480
+    observation_width: int = 640
+    render_mode: str = "rgb_array"
+    randomize: bool = False
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            "agent_pos": OBS_STATE,
+            "front": f"{OBS_IMAGE}.front",
+            "pixels/front": f"{OBS_IMAGES}.front",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if self.obs_type == "pixels":
+            self.features["front"] = PolicyFeature(
+                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+            )
+        elif self.obs_type == "pixels_agent_pos":
+            self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(6,))
+            self.features["pixels/front"] = PolicyFeature(
+                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+            )
+
+    @property
+    def package_name(self) -> str:
+        return "lerobot.envs.so101_cube_box"
+
+    @property
+    def gym_id(self) -> str:
+        return "lerobot/SO101CubeBox-v0"
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_width": self.observation_width,
+            "observation_height": self.observation_height,
+            "max_episode_steps": self.episode_length,
+            "randomize": self.randomize,
+            "task_instruction": self.task
+            or "Grab the purple cube and put it into the cardboard box, ignore the other objects",
+        }
+
+
 @EnvConfig.register_subclass("robotwin")
 @dataclass
 class RoboTwinEnvConfig(EnvConfig):

@@ -76,6 +76,8 @@ Metric: mixed-unit aggregate RMSE over a 30-step chunk (5 arm joints in degrees 
 | 09-25 | **FLUX 3 Action SO-101 + LoRA** (r/α 32, BFL `lora.json`), wrist duplicated (W1), EMA @ 1875 updates | batch 8, 4 Euler, guidance 3 | **14.20** | 0.47 | 1.56 | `VALID` @`a7c156de`, single seed; final @2500 = 14.54. H1/F5 not comparable (conditions on past commands). [plan §7](./plan_flux3_action.md#7-results-2026-09-25) |
 | 09-25 | FLUX 3 Action SO-101, **zero-shot**, wrist duplicated (W1), state quantiles recalibrated | 4 Euler, guidance 3 | 19.24 | 0.51 | 2.14 | `VALID` @`a7c156de`, 405 anchors. Conditions on the 8 recorded past commands → compare H1/F5 to `command_repeat` (19.69 / 1.40 / 4.11), not to the rows above. [plan §7](./plan_flux3_action.md#7-results-2026-09-25) |
 | 09-25 | FLUX 3 Action SO-101, zero-shot, checkpoint quantiles            | same                      |                   23.71 |  1.18 |  3.53 | `VALID`; our calibration is outside the checkpoint's state range (clipped)                                                   |
+| 10-31 | Cosmos 3 Edge (frozen base) + SmolExpert, 30m fast recipe (stride 1, cached VAE, Triton) | BS 16, 3 Euler steps, 2,580 steps | 16.64 | 6.28 | 8.01 | `VALID` @`a7c156de`, Val Flow Loss `0.0688`, Arm `17.81°`, Grip `8.61`. HF: `Orellius/so101_sort_cubes_no_top_cosmos3_edge_smolexpert` |
+| 10-31 | Cosmos 3 Edge **joint DoRA** (`r=16, α=32`, gen tower) + SmolExpert, 30m warm-start | BS 16, 3 Euler steps, 936 steps | **16.34** | **6.12** | **7.78** | `VALID` @`a7c156de`, Val Flow Loss `0.0712` (`0.0684` @ step 600; H1 `6.10` @ step 936), Arm `17.48°`, Grip `8.60`. HF: `Orellius/so101_sort_cubes_no_top_cosmos3_edge_dora_smolexpert` |
 
 ## 4. Video prediction (PSNR/SSIM) — diagnostic only
 

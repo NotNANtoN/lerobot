@@ -5,10 +5,13 @@ Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is aut
 
 ## 0a. Todo List with Nemo (2026-10-31)
 
-- [ ] **Build simulation for our SO-101 task**: Create a simulation environment matching our exact physical SO-101 setup (`sort-cubes` / `cube-out-of-box`), ideally using an LLM to reconstruct the exact scene, camera pose, and task geometry.
-- [ ] **Standardized validation loss tracking across all runs**: Track validation flow-matching loss + action RMSE (`Full-30`, `First-5`, `H1`, `Arm`, `Gripper`) during training for every run, strictly evaluated on the exact same held-out episode split across all trainings (`68:77` for `sort-cubes`, `32:40` for `cube_out_of_box v1`).
-- [ ] **Validation loss vs. physical picking correlation**: Systematically test whether lower validation loss / first-5 RMSE correlates with actual physical picking & sorting success rate on the robot.
-- [ ] **LoRA / DoRA on Cosmos for faster training & larger batch sizes**: Explore PEFT LoRA / DoRA directly on Cosmos (and quantized / pruned backbones) to increase effective batch size and training throughput.
+- [x] **Build simulation for our SO-101 task**: Created native MuJoCo Gymnasium environment `so101_cube_box` (`lerobot/SO101CubeBox-v0` in `src/lerobot/envs/so101_cube_box.py` + `src/lerobot/envs/so101_assets/so101_cube_box_scene.xml`) using official TheRobotStudio SO-101 CAD meshes + Hex-Nut UVC wrist camera (`pos="0.002 0.056 -0.032"`, `xyaxes="-1 0 0 0 -0.66 0.75"`, `fovy="62"`), primitive jaw contact pads, and exact dataset kinematics (`Episode 0` action replay physically grasps, lifts, transports, and drops the purple cube into the cardboard box with `reward=1.00`, `is_success=True`).
+- [x] **Standardized validation loss tracking across all runs**: Track validation flow-matching loss + action RMSE (`Full-30`, `First-5`, `H1`, `Arm`, `Gripper`) during training for every run, strictly evaluated on the exact same held-out episode split across all trainings (`68:77` for `sort-cubes`, `32:40` for `cube_out_of_box v1`).
+- [ ] **Validation loss vs. physical picking correlation**: Systematically test whether lower validation loss / first-5 RMSE correlates with actual physical picking & sorting success rate on the robot (and in `so101_cube_box` MuJoCo simulation).
+- [x] **LoRA / DoRA on Cosmos for faster training & larger batch sizes**: Implemented joint PEFT LoRA and DoRA (`--train-backbone-lora` / `--train-backbone-dora`) on `Cosmos3OmniTransformer` with RAM-cached VAE latents + Triton kernels (`BS=16`, ~9.0–10.5 samples/s on RTX 6000 Ada) and zero-overhead inference weight merging (`merge_lora_into_base`).
+  - **Frozen Backbone (30m, 2,580 steps @ BS 16)**: Val Loss **`0.0688`**, RMSE **`16.64`** (Arm `17.81°`, Grip `8.61`), H1 **`6.28`**, First-5 **`8.01`** (`Orellius/so101_sort_cubes_no_top_cosmos3_edge_smolexpert`).
+  - **Joint DoRA (30m, r=16, α=32)**: Val Loss **`0.0684`** (step 600), Best RMSE **`16.34`** (Arm `17.48°`, Grip `8.60`), H1 **`6.12`** (`6.10` @ step 936), First-5 **`7.78`** (`Orellius/so101_sort_cubes_no_top_cosmos3_edge_dora_smolexpert`).
+  - **Joint LoRA (30m, r=16, α=32)**: Running on RunPod (`Orellius/so101_sort_cubes_no_top_cosmos3_edge_lora_smolexpert`).
 
 ## 0. Goals (stated by Anton, 2026-09-24)
 
