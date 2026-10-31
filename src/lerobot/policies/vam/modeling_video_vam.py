@@ -438,6 +438,21 @@ class VideoVAMPolicy(PreTrainedPolicy):
             raise ValueError("init_rtc_processor requires config.rtc_config")
         self.rtc_processor = RTCProcessor(self.config.rtc_config)
 
+    def _update_frame_history(self, batch: dict[str, Tensor]) -> Tensor | None:
+        single_frame = batch.get(self.config.camera_key)
+        if not isinstance(single_frame, Tensor):
+            return None
+        if single_frame.ndim == 3 and single_frame.shape[-1] == 3:
+            single_frame = single_frame.permute(2, 0, 1).unsqueeze(0)
+        elif single_frame.ndim == 3 and single_frame.shape[0] == 3:
+            single_frame = single_frame.unsqueeze(0)
+        if not self._frame_history:
+            for _ in range(5):
+                self._frame_history.append(single_frame)
+        else:
+            self._frame_history.append(single_frame)
+        return torch.stack(list(self._frame_history), dim=2)
+
     @torch.no_grad()
     def predict_action_chunk(
         self,
@@ -448,25 +463,18 @@ class VideoVAMPolicy(PreTrainedPolicy):
         feature_noise_seed: int | None = None,
         inference_delay: int | None = None,
         prev_chunk_left_over: Tensor | None = None,
+        _history_already_updated: bool = False,
     ) -> Tensor:
         if self._closed:
             raise RuntimeError("VideoVAMPolicy is closed")
         history_key = f"{self.config.camera_key}.history"
         history = batch.get(history_key)
         if not isinstance(history, Tensor):
-            single_frame = batch.get(self.config.camera_key)
-            if isinstance(single_frame, Tensor):
-                if single_frame.ndim == 3 and single_frame.shape[-1] == 3:
-                    single_frame = single_frame.permute(2, 0, 1).unsqueeze(0)
-                elif single_frame.ndim == 3 and single_frame.shape[0] == 3:
-                    single_frame = single_frame.unsqueeze(0)
-                if not self._frame_history:
-                    for _ in range(5):
-                        self._frame_history.append(single_frame)
-                else:
-                    self._frame_history.append(single_frame)
+            if _history_already_updated and self._frame_history:
                 history = torch.stack(list(self._frame_history), dim=2)
             else:
+                history = self._update_frame_history(batch)
+            if not isinstance(history, Tensor):
                 raise ValueError(f"batch is missing {history_key}; use inference.observation_history_size=5")
         state = batch.get(OBS_STATE)
         if isinstance(state, Tensor) and state.ndim == 1 and state.shape[0] == 6:
@@ -536,9 +544,15 @@ class VideoVAMPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
+        history_key = f"{self.config.camera_key}.history"
+        history_updated = False
+        if not isinstance(batch.get(history_key), Tensor):
+            self._update_frame_history(batch)
+            history_updated = True
         if not self._action_queue:
-            chunk = self.predict_action_chunk(batch, **kwargs)
-            self._action_queue.extend(chunk[:, index] for index in range(chunk.shape[1]))
+            chunk = self.predict_action_chunk(batch, _history_already_updated=history_updated, **kwargs)
+            n_steps = min(chunk.shape[1], max(1, int(self.config.n_action_steps)))
+            self._action_queue.extend(chunk[:, index] for index in range(n_steps))
         return self._action_queue.popleft()
 
     def reset(self) -> None:
