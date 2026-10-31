@@ -169,6 +169,12 @@ def checkpoint_identity(args: argparse.Namespace) -> dict[str, Any]:
             "joint_limits_max": args.joint_limits_max,
             "jepa_planning_mode": getattr(args, "jepa_planning_mode", "none"),
             "jepa_num_candidates": getattr(args, "jepa_num_candidates", 8),
+            "expo_checkpoint": str(args.expo_checkpoint) if getattr(args, "expo_checkpoint", None) else None,
+            **(
+                {"shared_detector_checkpoint": str(args.shared_detector_checkpoint)}
+                if getattr(args, "shared_detector_checkpoint", None)
+                else {}
+            ),
         },
     }
 
@@ -245,6 +251,35 @@ class RPCApplication:
             self.history_key = f"{config.camera_key}.history"
             self.history_index_key = HISTORY_FRAME_INDEX_KEY
             self.config = config
+            self.expo_critic = None
+            self.expo_checkpoint_path = getattr(args, "expo_checkpoint", None)
+            self.shared_detector = None
+            self.current_episode_steps: list[dict[str, torch.Tensor]] = []
+            self.online_rollout_buffer: list[dict[str, Any]] = []
+            if getattr(args, "shared_detector_checkpoint", None) is not None:
+                from lerobot.rewards.sequence_detector import SharedFeatureSequenceDetector
+
+                det_ckpt = torch.load(
+                    args.shared_detector_checkpoint, map_location=self.device, weights_only=False
+                )
+                det_state = det_ckpt["state_dict"] if isinstance(det_ckpt, dict) and "state_dict" in det_ckpt else det_ckpt
+                seq_len = int(det_ckpt.get("seq_len", 12)) if isinstance(det_ckpt, dict) else 12
+                self.shared_detector = SharedFeatureSequenceDetector(seq_len=seq_len).to(self.device)
+                self.shared_detector.load_state_dict(det_state, strict=False)
+                self.shared_detector.eval()
+            if self.expo_checkpoint_path is not None or self.shared_detector is not None:
+                from lerobot.policies.vam.expo_residual import ExpoResidualCritic
+
+                if self.expo_checkpoint_path is not None and Path(self.expo_checkpoint_path).is_file():
+                    state_dict = torch.load(
+                        self.expo_checkpoint_path, map_location=self.device, weights_only=True
+                    )
+                    use_init_anchor = any(k.startswith("init_proj.") for k in state_dict)
+                    self.expo_critic = ExpoResidualCritic(use_init_anchor=use_init_anchor).to(self.device)
+                    self.expo_critic.load_state_dict(state_dict, strict=False)
+                else:
+                    self.expo_critic = ExpoResidualCritic(use_init_anchor=True).to(self.device)
+                self.expo_critic.eval()
         from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
         if not 1 <= self.execution_horizon <= self.horizon:
@@ -344,7 +379,36 @@ class RPCApplication:
                 kwargs["feature_noise_seed"] = supplied_seed
             if "prev_chunk_left_over" in kwargs and self.backend.rtc_processor is None:
                 raise RuntimeError("RTC leftover received but rtc_processor is not initialized")
-            actions = self.backend.predict_action_chunk(batch, **kwargs)[0].cpu()
+            if getattr(self, "expo_critic", None) is not None:
+                from lerobot.policies.vam.modeling_video_vam import restore_uint8_history
+
+                images = restore_uint8_history(batch[self.history_key].to(self.device))
+                context = self.backend._extract_context(images, int(supplied_seed or frame_index))
+                state_t = state.unsqueeze(0).to(self.device, dtype=torch.float32)
+                t_norm = torch.tensor([[min(1.0, frame_index / 360.0)]], device=self.device, dtype=torch.float32)
+                base_actions = self.backend.decoder.sample_actions(
+                    state_t, context, seed=int(supplied_seed or 0), use_cuda_graph=False
+                )[0].cpu()
+                actions = self.expo_critic.select_best_edited_chunk(
+                    self.backend.decoder, state_t, context, t_norm, base_seed=int(supplied_seed or 0)
+                )[0].cpu()
+                if self.lower is not None and self.upper is not None:
+                    lo = torch.tensor(self.lower, dtype=actions.dtype)
+                    hi = torch.tensor(self.upper, dtype=actions.dtype)
+                    actions = torch.max(torch.min(actions, hi), lo)
+                if hasattr(self, "current_episode_steps"):
+                    ctx_pooled = self.expo_critic.pool_ctx_tokens(context)[0].detach().cpu()
+                    self.current_episode_steps.append(
+                        {
+                            "ctx": ctx_pooled,
+                            "state": state.detach().cpu(),
+                            "t_norm": t_norm[0].detach().cpu(),
+                            "base_action": base_actions.detach().cpu(),
+                            "exec_action": actions.detach().cpu(),
+                        }
+                    )
+            else:
+                actions = self.backend.predict_action_chunk(batch, **kwargs)[0].cpu()
             original = actions.clone()
         actions = validate_chunk(actions, horizon=self.horizon)
         original = validate_chunk(original, horizon=self.horizon, name="original_chunk")
@@ -369,6 +433,84 @@ class RPCApplication:
             "latency_s": time.perf_counter() - started,
         }
 
+    def complete_episode(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("identity") != self.identity or payload.get("instance_id") != self.instance_id:
+            raise ValueError("server identity/instance mismatch")
+        spawn_group = int(payload.get("spawn_group", 0))
+        update_critic = bool(payload.get("update_critic", False))
+        update_steps = int(payload.get("update_steps", 600))
+        manual_reward = payload.get("manual_reward")
+
+        steps = list(getattr(self, "current_episode_steps", []))
+        if hasattr(self, "current_episode_steps"):
+            self.current_episode_steps.clear()
+        if getattr(self, "expo_critic", None) is not None:
+            self.expo_critic.reset_episode()
+
+        reward_prob = 0.0
+        if manual_reward is not None:
+            reward_prob = float(manual_reward)
+            reward = 1.0 if reward_prob >= 0.5 else 0.0
+        elif getattr(self, "shared_detector", None) is not None and steps:
+            seq_len = self.shared_detector.seq_len
+            if len(steps) >= seq_len:
+                window = steps[-seq_len:]
+            else:
+                window = [steps[0]] * (seq_len - len(steps)) + steps
+            seq_ctx = torch.stack([s["ctx"] for s in window], dim=0).unsqueeze(0).to(self.device)
+            seq_states = torch.stack([s["state"] for s in window], dim=0).unsqueeze(0).to(self.device)
+            reward_prob = float(self.shared_detector.predict_proba(seq_ctx, seq_states).item())
+            reward = 1.0 if reward_prob >= 0.5 else 0.0
+        else:
+            reward = 0.0
+
+        if not hasattr(self, "online_rollout_buffer"):
+            self.online_rollout_buffer = []
+        if steps:
+            self.online_rollout_buffer.append(
+                {
+                    "steps": steps,
+                    "reward": reward,
+                    "reward_prob": reward_prob,
+                    "spawn_group": spawn_group,
+                }
+            )
+
+        from lerobot.policies.vam.expo_residual import compute_dr_grpo_advantages
+
+        all_rewards = [float(ep["reward"]) for ep in self.online_rollout_buffer]
+        all_groups = [int(ep["spawn_group"]) for ep in self.online_rollout_buffer]
+        adv_all = compute_dr_grpo_advantages(all_rewards, all_groups) if all_rewards else torch.zeros(1)
+        latest_adv = float(adv_all[-1].item()) if len(all_rewards) > 0 else 0.0
+        group_rewards = [r for r, g in zip(all_rewards, all_groups, strict=False) if g == spawn_group]
+        group_mean = float(sum(group_rewards) / len(group_rewards)) if group_rewards else 0.0
+
+        critic_updated = False
+        update_loss = None
+        if update_critic and getattr(self, "expo_critic", None) is not None and self.online_rollout_buffer:
+            stats = self.expo_critic.update_from_episode_buffer(
+                self.online_rollout_buffer, steps=update_steps
+            )
+            critic_updated = True
+            update_loss = float(stats["loss"])
+            save_path = payload.get("save_checkpoint") or getattr(self, "expo_checkpoint_path", None)
+            if save_path:
+                out_p = Path(save_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(self.expo_critic.state_dict(), out_p)
+
+        return {
+            "episode_count": len(self.online_rollout_buffer),
+            "recorded_chunks": len(steps),
+            "reward": reward,
+            "reward_prob": reward_prob,
+            "spawn_group": spawn_group,
+            "group_mean_reward": group_mean,
+            "advantage": latest_adv,
+            "critic_updated": critic_updated,
+            "update_loss": update_loss,
+        }
+
     def close(self) -> None:
         closer = getattr(self.backend, "close", None)
         if closer is not None:
@@ -389,11 +531,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, self.app.health())
 
     def do_POST(self) -> None:
-        if self.path != "/predict":
-            self._send(404, {"error": "use POST /predict"})
+        if self.path not in ("/predict", "/episode_complete"):
+            self._send(404, {"error": "use POST /predict or POST /episode_complete"})
             return
         try:
-            self.connection.settimeout(10.0)
+            self.connection.settimeout(30.0 if self.path == "/episode_complete" else 10.0)
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= MAX_REQUEST_BYTES:
                 raise ValueError("invalid request size")
@@ -405,7 +547,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(409, {"error": "inference already in progress"})
                 return
             try:
-                result = self.app.predict(payload)
+                if self.path == "/episode_complete":
+                    result = self.app.complete_episode(payload)
+                else:
+                    result = self.app.predict(payload)
             finally:
                 self.app.predict_lock.release()
             self._send(200, result)
@@ -475,6 +620,18 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=8,
         help="Number of SmolExpert candidate chunks sampled per control step for JEPA search.",
+    )
+    parser.add_argument(
+        "--expo-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional ExpoResidualCritic (.pt) checkpoint for score-centered residual action editing.",
+    )
+    parser.add_argument(
+        "--shared-detector-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional SharedFeatureSequenceDetector (.pt) checkpoint for automated online reward scoring.",
     )
     args = parser.parse_args(argv)
     if args.euler_steps is not None and args.euler_steps < 1:

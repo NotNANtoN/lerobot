@@ -2166,3 +2166,58 @@ Before pushing, the uncommitted working tree on abakus (at `f576307f`) was diffe
 - **Superseded:** `run_online_aug_v2_queue.sh` (Phase 6 Cosmos-2B + FLUX queue; replaced by presets) and the 09-14 roadmap note (content below).
 - **09-14 correction recovered from the abakus roadmap:** Cosmos 3 online-aug evaluations were re-run with caches built from the training LoRA (reports in `outputs/evaluation/cosmos3-online-aug-eval-fix-20260914/` on abakus). Corrected original-best scores (Eval-1 / Eval-2): **V1-trained 13.821 / 24.886; V2-trained 15.577 / 17.992**. V2 checkpoint selection remains affected by the old validation mismatch; augmentation benefit is not established. Leaderboard updated accordingly.
 - **Refinement of B2/B3 from abakus run manifests:** `v2-cosmos2b-t2-online-aug-smolexpert` (Phase 6, 15.57 / 18.71) actually used alpha **16** and σ **10**, matching its eval cache (`v2-cosmos2b-t2-undistilled`, α 16, σ 10). So that run is _not_ affected by B2/B3; it stays `PROVISIONAL` (v2 dataset). Only `v1-cosmos2b-t2-online-unaugmented` (α 32 vs cache α 16) is invalidated by B2. The FLUX Scale-100 cache (built 09-07) records no VAE hash, so its provenance cannot confirm a real VAE; together with the online pseudo-latent bug, all FLUX Scale-100 numbers are treated as unverified.
+
+---
+
+## 2026-10-31 — SO-101 MuJoCo Digital Twin, Offline-to-Sim Correlation, and Sim-FT + DAgger vs. EXPO-FT Post-Training
+
+### 1. Native SO-101 Wrist-Camera MuJoCo Environment (`lerobot/SO101CubeBox-v0`)
+
+We built a physical digital twin for the `Orellius/so101_sort_cubes_no_top` task (*"Grab the purple cube and put it into the cardboard box, ignore the other objects"*) in `src/lerobot/envs/so101_cube_box.py` + `src/lerobot/envs/so101_assets/so101_cube_box_scene.xml`:
+
+- **Embodiment & Camera**: Official TheRobotStudio SO-101 STL meshes, calibrated degree-to-radian servo mapping (`lerobot_to_mujoco_qpos` / `mujoco_to_lerobot_qpos`), high-friction jaw contact pads (`fixed_jaw_pad`, `moving_jaw_pad`), and the Hex-Nut UVC wrist camera (`pos="0.002 0.056 -0.032"`, `xyaxes="-1 0 0 0 -0.66 0.75"`, `fovy="62"`, 640×480 RGB @ 30 Hz).
+- **Rollout Frame-History Bugfix (`9880aa6a`)**: Fixed `VideoVAMPolicy.select_action` and `predict_action_chunk` in `src/lerobot/policies/vam/modeling_video_vam.py` so `_frame_history` updates on every control step rather than only when `_action_queue` empties (every 30 steps), ensuring the 5-frame causal window spans consecutive 30 Hz frames `[t-4..t]` instead of 150 steps.
+
+### 2. Offline Validation Loss vs. Closed-Loop Physical Simulation Correlation
+
+We trained three 30-minute Cosmos 3 Edge checkpoints at `BS=16` on `Orellius/so101_sort_cubes_no_top` (train `0:68`, held-out `68:77`), uploaded each to a dedicated Hugging Face repository, and benchmarked them in closed-loop simulation across held-out episodes `68..72` with the purple cube spawned at each episode's FK grasp coordinates:
+
+| Metric | **Frozen Backbone** (`2,580` steps) | **Joint DoRA** (`936` steps) | **Joint LoRA** (`1,020` steps) | Correlation Finding |
+| :--- | :---: | :---: | :---: | :--- |
+| **HF Repository** | [`..._cosmos3_edge_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_smolexpert) | [`..._cosmos3_edge_dora_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_dora_smolexpert) | [`..._cosmos3_edge_lora_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_lora_smolexpert) | Separate repos uploaded |
+| **Offline Val Flow Loss** | `0.0688` | **`0.0684`** | `0.0710` | DoRA lowest flow loss |
+| **Offline Val Full-30 RMSE** | `16.637` | `16.335` | **`16.322`** | LoRA lowest 30-step RMSE |
+| **Offline Val First-5 RMSE** | `8.007` | `7.775` | **`7.744`** | Strongly predicts closed-loop tracking |
+| **Closed-Loop Trajectory RMSE** | `25.24°` | **`21.83°`** (-13.5%) | `21.94°` (-13.1%) | Joint PEFT cuts closed-loop drift by >3.3° |
+| **Mean Min Gripper-to-Cube Dist** | `8.42 cm` | `4.96 cm` | **`4.68 cm`** | LoRA reaches **3.74 cm closer** on average |
+| **Best Single-Episode Approach** | `4.0 cm` (Ep 69) | `2.7 cm` (Ep 69) | **`1.7 cm`** (Ep 69, lifted `1.2 cm`) | LoRA physically contacts & lifts cube |
+| **Mean Max Shaped Reward** | `0.1900` | `0.2146` | **`0.2166`** | Strictly monotonic with First-5 RMSE |
+
+### 3. Sim Post-Training: Sim-FT + Online DAgger vs. EXPO-FT Residual RL
+
+We evaluated both post-training paradigms across 5 randomized cube spawns (`eval_spawns`, $\pm 3.5\text{ cm}$) in `lerobot/SO101CubeBox-v0`:
+
+1. **Teleoperator Hesitation Loop & Markov Aliasing Discovery**:
+   In `Episode 0` of the real dataset, the human teleoperator hesitated between steps 30 and 150 (lifting and lowering the gripper in place at $d \approx 12.5\text{ cm}$). Naive behavioral cloning on this loop caused closed-loop policies to stall due to identical `(state, wrist_image)` pairs mapping to opposing velocities. Replacing steps `15..165` with a smooth 30-step linear interpolation bridge produced a clean 360-step (12-chunk) monotonic trajectory (`100%` IK expert success across all 5 spawns).
+2. **Wrist-Camera Feature Sensitivity in High-Dimensional Cross-Attention**:
+   In `Cosmos3FeatureExtractor` (`[1, 600, 2048]` tokens), moving the $3\text{ cm}$ purple cube on the table changes only ~0.5% of the image pixels (`ctx` delta $\approx 0.004\text{–}0.035$), whereas a $0.25^\circ$ wrist-camera tilt shifts 100% of the background pixels (`ctx` delta $\approx 0.054\text{–}0.068$). Directly fine-tuning the 100M-parameter `SmolExpertActionDecoder` on small online buffers ($N=60\text{–}180$) causes the 600-token cross-attention to overfit background pixel patches and amplify sub-degree wrist-camera tilts.
+3. **Why EXPO-FT Residual RL Outperforms Direct Decoder Fine-Tuning**:
+   Following Perry Dong & Chelsea Finn's EXPO-FT framework, keeping the pretrained 100M-parameter flow-matching decoder anchored preserves its smooth 25,000-frame visual representation, while a lightweight $3 \times 4$ spatially-pooled residual action editor $\Delta a_\phi$ + concave value critic $Q_\psi$ (evaluating $K=6$ edited action chunks) adapts the trajectory without overfitting high-resolution background patches.
+
+| Post-Training Method | Mean Max Reward | Mean Min EE-to-Cube (`cm`) | Mean Max Cube Lift (`cm`) | Task Success Rate (`5` Spawns) | Key Behavior |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Zero-Shot LoRA** (Real-Trained Base) | `0.2002` | `6.96 cm` | `0.40 cm` | `0%` (`0/5`) | Approaches workspace, misses cube by ~4–9 cm due to sim visual gap |
+| **Method 1: Sim-FT + Online DAgger** | `0.2874` (up to `0.3904`) | `3.54 cm` (best `2.70 cm`) | `0.92 cm` (up to `4.50 cm`, peak `17.4 cm`) | `0%` (`0/5`) | Cuts approach error by **49%** (`1.5–2.4 cm` on best trials) and lifts cube up to `17.4 cm`, but 600-token cross-attention is sensitive to wrist-camera tilt |
+| **Method 2: EXPO-FT Residual RL** ($\Delta a_\phi + Q_\psi$) | **`0.6908`** (+245%) | **`2.46 cm`** (best `0.99 cm`) | **`13.04 cm`** (up to `21.8 cm`) | **`60%`** (`3/5` single ckpt; `4/5 = 80%` across 2 LR seeds) | Grasps, lifts (`19.7–23.6 cm`), transports across desk, and drops purple cube inside the cardboard box (`reward = 1.000`) |
+
+### 4. Boosted Real-Data Multi-Frame Sequence Detector & 10-Spawn EXPO vs. Score-Centered EXPO (Dr. GRPO) Ablation
+
+1. **Boosting Real-Data Multi-Frame Sequence Detector (`68.8%` → `100.0%` Precision on Held-Out Test `68..72`, `97.3%` on `68..76`)**:
+   - **Root cause of prior `68.8%` precision**: In `Orellius/so101_sort_cubes_no_top`, 76/77 episodes place cubes into the cardboard box at positive shoulder pan angles (`pan > 32°`, $L=590\text{–}887$). Only Episode 2 had an operator recording error (`pan < 14°`). The earlier heuristic used `argmax(abs(pan))`, which mislabeled far-left table reaches (negative pan) as box drops on Episode 72 and sampled negative windows overlapping earlier drops on multi-cube episodes.
+   - **Strict 3-way split & regularizers**: Using **Train (`0..57`)**, **Val (`58..67`)**, and untouched **Held-Out Test (`68..72` & `68..76`)**, we added 6-view spatial/photometric augmentations, MixView feature interpolation, 15% temporal token dropout, and 50% proprioceptive modality dropout (preventing the detector from relying on a joint-angle shortcut). Early-stopping on Val (`val_loss = 0.0567` @ step 800) achieved **`100.0%` Accuracy / `100.0%` Precision / `100.0%` Recall (`1.000` F1)** on both Val (`58..67`) and canonical Held-Out Test (`68..72`) with **`0.0%` empty-box false positives**, and **`99.2%` Accuracy / `97.3%` Precision / `100.0%` Recall (`0.986` F1)** across all 9 Held-Out Test episodes (`68..76`)—even when evaluated **100% blind to joint states (`seq_states = 0`)**.
+2. **10-Spawn Ablation: Vanilla EXPO vs. Score-Centered EXPO (Dr. GRPO) at `2,500` (`1x`) and `5,000` (`2x`) Steps**:
+   - We expanded closed-loop evaluation to **10 randomized cube spawns ($\pm 3.5\text{ cm}$)** with a 60-episode exploration buffer (`6` rollouts/spawn; **98.33% agreement** between the learned sequence detector and the sparse environment oracle).
+   - **MuJoCo IK Jacobian (`cdof`) & Episode-Initial Visual Anchoring**: Fixed `solve_ik_delta` to call `mj_forward` rather than `mj_kinematics` (so `data.cdof` is never stale across episodes) and added episode-initial visual token anchoring (`init_ctx` at $t=0$) in `ExpoResidualCritic` (`src/lerobot/policies/vam/expo_residual.py`) so the 2D cube spawn position observed by the wrist camera at $t=0$ is immune to closed-loop camera viewpoint drift.
+   - **Why Score Centering (Dr. GRPO) Outperforms Vanilla Uncentered EXPO**:
+     - Under **Vanilla EXPO** ($w_i = \exp(\beta R_i)$ without subtracting group mean $\bar{R}_g$), failed rollouts ($R=0$) retain positive weight $w_0 = \exp(0) > 0$ and easy spawns outnumber hard spawns $4:1$, creating a **`2.25°` target bias** (`7.33°` on peripheral Spawn 6, `4.09°` on Spawn 8). Consequently, Vanilla EXPO plateaus at **`7/10 (70%)`** under the learned sequence detector even when doubling training to 5,000 steps.
+     - Under **Score-Centered EXPO (Dr. GRPO)** ($A_{g,i} = R_{g,i} - \bar{R}_g$ without dividing by $\sigma_g$), failed rollouts ($A_{g,i} \le 0$) receive **exact zero** actor weight (`0.00°` oracle target bias, `0.13°` detector target bias—**17x lower bias**) while hard peripheral spawns ($\bar{R}_g = 1/6 \implies A_{g,i} = 0.833$) are automatically upweighted. Doubling training from 2,500 to **5,000 steps (`2x`)** boosts closed-loop success to **`9/10 (90%)`** under both the **100% Learned Multi-Frame Sequence Detector** (`min_ee = 1.68 cm`, `max_lift = 19.32 cm`, `dense_rew = 0.922`) and the **Sparse Oracle** (`min_ee = 1.53 cm`, `max_lift = 19.64 cm`, `dense_rew = 0.922`).

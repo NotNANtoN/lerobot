@@ -46,3 +46,18 @@ def test_so101_cube_box_env_creation_and_step():
         assert "is_success" in info2
     finally:
         close_envs(envs)
+
+
+def test_so101_cube_box_sparse_reward_mode():
+    cfg = make_env_config("so101_cube_box", episode_length=50, reward_mode="sparse")
+    envs = make_env(cfg, n_envs=1)
+    try:
+        vec_env = envs["so101_cube_box"][0]
+        vec_env.reset(seed=0)
+        action = np.array([[0.0, -20.0, 30.0, 50.0, -90.0, 20.0]], dtype=np.float32)
+        _, rew, term, _, info = vec_env.step(action)
+        assert not term[0]
+        assert rew[0] == 0.0
+        assert info["dense_reward"][0] > 0.0
+    finally:
+        close_envs(envs)

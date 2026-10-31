@@ -102,3 +102,27 @@ If user prompt ends with:
 
 - **Branches**: New branch names use `feat-ABC` or `fix-ABC` (avoid slashes if possible).
 - **Commits**: Never amend commits; create follow-up commits. Do not commit or push unless explicitly requested.
+
+---
+
+## Video-VAM & SO-101 Real-Robot Post-Training Goals (Nemo & Anton)
+
+1. **Real-Robot First Philosophy (Sim is for Validation & Algorithm Testing Only)**:
+   - All methods must work on the **physical SO-101 robot arm with a wrist-only camera** (`observation.images.front`) and 6-D joint state (`observation.state`).
+   - Do **not** rely on simulation-only privileged state (`cube_pos`, `dist_to_cube`) or large-scale sim-to-real pretraining; train on real robot data (`Orellius/so101_sort_cubes_no_top`) and realistic episode budgets (~15–70 episodes).
+   - The MuJoCo digital twin (`lerobot/SO101CubeBox-v0`) is strictly a controllable testbed to benchmark offline-to-online correlation, sparse-reward RL post-training, and learned reward detectors before/alongside physical robot runs.
+2. **Consistent Validation Loss & Offline-to-Physical Correlation**:
+   - Track validation loss and **First-5 Action RMSE** across all training runs on the exact same held-out real episodes (`68..72` of `Orellius/so101_sort_cubes_no_top`).
+   - Verify that offline First-5 RMSE correlates with actual closed-loop picking and tracking performance.
+3. **PEFT (LoRA / DoRA) on Video Backbones**:
+   - Use LoRA / DoRA on `Cosmos 3 Edge` (and `FLUX 3 Action`) for fast training, higher batch sizes (`BS 16`), and improved visual alignment over frozen-backbone extraction.
+   - Upload Frozen, DoRA, and LoRA checkpoints to separate Hugging Face repositories for clean benchmarking.
+4. **EXPO Residual RL & Score-Centered / Dr. GRPO Post-Training under Sparse Rewards**:
+   - Keep the pretrained video backbone (`Cosmos 3 Edge LoRA`) and flow-matching decoder (`SmolExpert`) **100% frozen** during online/post-training to prevent cross-attention overfitting on small rollout buffers.
+   - Train a lightweight **EXPO Residual Actor ($\Delta a_\phi$) + Concave Critic ($Q_\psi$)** with $3 \times 4$ spatial token pooling and **Dr. GRPO / Score-Centered advantages** (mean-centered without $\div \sigma$ explosion).
+   - Validate post-training using **pure sparse rewards (`reward_mode="sparse"`, `0/1`)** and using **only a learned reward detector** (zero ground-truth reward from the simulator).
+5. **Multi-Frame Sequence Success Detector (Replacing Single-Frame ResNet-50)**:
+   - Single-frame ResNet-50 reward classifiers glitch on wrist-camera views (hallucinating `reward = 1.0` whenever the open gripper looks at the cardboard box).
+   - Train and validate a **multi-frame temporal sequence + proprioception (`agent_pos`) success detector** that observes the causal grasp-carry-release transition into the box:
+     - Train on real dataset episodes (`0..67`) and evaluate on held-out episodes (`68..72`), including hard negatives (looking at the box without holding/dropping the cube).
+     - Train the same sequence detector architecture on a realistic small set of simulated episodes and run RL post-training driven **100% by the learned sequence detector** (no ground-truth environment reward).

@@ -188,6 +188,10 @@ def _server_args(args: argparse.Namespace) -> list[str]:
     if args.joint_limits_min is not None:
         values += ["--joint-limits-min", *map(str, args.joint_limits_min)]
         values += ["--joint-limits-max", *map(str, args.joint_limits_max)]
+    if getattr(args, "expo_checkpoint", None) is not None:
+        values += ["--expo-checkpoint", str(args.expo_checkpoint)]
+    if getattr(args, "shared_detector_checkpoint", None) is not None:
+        values += ["--shared-detector-checkpoint", str(args.shared_detector_checkpoint)]
     return values
 
 
@@ -501,6 +505,62 @@ class VideoVAMRPCClient:
             if result.get(key) != payload[key]:
                 raise RuntimeError(f"RPC response {key} mismatch")
         _chunks_from_result(result, self.health["horizon"])
+        return result
+
+    def complete_episode(
+        self,
+        *,
+        spawn_group: int = 0,
+        update_critic: bool = False,
+        update_steps: int = 600,
+        save_checkpoint: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "identity": self.health["identity"],
+            "instance_id": self.health["instance_id"],
+            "spawn_group": int(spawn_group),
+            "update_critic": bool(update_critic),
+            "update_steps": int(update_steps),
+            "save_checkpoint": save_checkpoint,
+        }
+        command = shlex.join(
+            [
+                "curl",
+                "--fail-with-body",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                str(self.timeout),
+                "-X",
+                "POST",
+                f"http://127.0.0.1:{self.port}/episode_complete",
+                "-H",
+                "Content-Type: application/json",
+                "--data-binary",
+                "@-",
+            ]
+        )
+        cmd = (
+            ["bash", "-c", command]
+            if _is_local_host(self.ssh_host)
+            else [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command]
+        )
+        completed = subprocess.run(
+            cmd,
+            input=json.dumps(payload, allow_nan=False).encode(),
+            capture_output=True,
+            check=False,
+            timeout=self.timeout + 12,
+        )
+        if completed.returncode:
+            raise RuntimeError(
+                f"Episode completion RPC failed: {completed.stderr.decode(errors='replace')} {completed.stdout.decode(errors='replace')[:1000]}"
+            )
+        result = json.loads(completed.stdout)
+        if not isinstance(result, dict) or "error" in result:
+            raise RuntimeError(f"RPC episode_complete error: {result}")
         return result
 
 
@@ -823,8 +883,14 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
         print(f"[BASE POSE] Recorded initial pose as home: {[f'{x:.1f}°' for x in home_pose]}")
 
         episodes = 0
-        num_ep = getattr(args, "num_episodes", 1)
+        online_ep = getattr(args, "online_expo_episodes", None)
+        num_ep = online_ep if (online_ep is not None and online_ep > 0) else getattr(args, "num_episodes", 1)
         target_episodes = num_ep if num_ep > 0 else float("inf")
+        online_enabled = bool(
+            (online_ep is not None and online_ep > 0)
+            or getattr(args, "shared_detector_checkpoint", None) is not None
+        )
+        update_interval = max(1, int(getattr(args, "online_update_interval", 5)))
         while episodes < target_episodes:
             episodes += 1
             print(f"\n{'=' * 55}")
@@ -832,6 +898,28 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
             print(f"{'=' * 55}")
 
             _run_single_episode(robot, args, client, executor)
+
+            if online_enabled:
+                should_update = (episodes % update_interval == 0) or (episodes == target_episodes)
+                ep_stats = client.complete_episode(
+                    spawn_group=getattr(args, "spawn_group", 0),
+                    update_critic=should_update,
+                    update_steps=getattr(args, "online_update_steps", 600),
+                    save_checkpoint=getattr(args, "expo_checkpoint", None),
+                )
+                rew_icon = "✅ SUCCESS (1.0)" if ep_stats.get("reward", 0.0) >= 0.5 else "❌ FAIL (0.0)"
+                print(
+                    f"[EXPO-ONLINE] Ep {episodes}: {rew_icon} "
+                    f"(p={ep_stats.get('reward_prob', 0.0):.3f}, "
+                    f"group={ep_stats.get('spawn_group', 0)}, "
+                    f"R_mean={ep_stats.get('group_mean_reward', 0.0):.2f}, "
+                    f"A_dr_grpo={ep_stats.get('advantage', 0.0):+.2f})"
+                )
+                if ep_stats.get("critic_updated"):
+                    print(
+                        f"  🔥 Updated ExpoResidualCritic on {ep_stats.get('episode_count', episodes)} "
+                        f"episodes (loss={ep_stats.get('update_loss', 0.0):.4f})"
+                    )
 
             if episodes < target_episodes:
                 print(f"\n[RESET] Episode {episodes} complete. Smoothly returning to base position...")
@@ -873,6 +961,42 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default="cosmos3_lora",
         help="Model alias ('cosmos3_lora', 'cosmos2b_t2_distilled', 'smolvla_v2') or path (default 'cosmos3_lora')",
+    )
+    parser.add_argument(
+        "--expo-checkpoint",
+        type=str,
+        default=None,
+        help="Optional path to an ExpoResidualCritic (.pt) checkpoint on the inference host.",
+    )
+    parser.add_argument(
+        "--shared-detector-checkpoint",
+        type=str,
+        default=None,
+        help="Optional path to a SharedFeatureSequenceDetector (.pt) checkpoint for automated online reward detection.",
+    )
+    parser.add_argument(
+        "--online-expo-episodes",
+        type=int,
+        default=None,
+        help="Number of physical episodes to run in an automated online Score-Centered EXPO post-training session.",
+    )
+    parser.add_argument(
+        "--online-update-interval",
+        type=int,
+        default=5,
+        help="Update ExpoResidualCritic weights every K episodes during online post-training (default 5).",
+    )
+    parser.add_argument(
+        "--online-update-steps",
+        type=int,
+        default=600,
+        help="Gradient steps per online ExpoResidualCritic update (default 600).",
+    )
+    parser.add_argument(
+        "--spawn-group",
+        type=int,
+        default=0,
+        help="Integer spawn group ID for Dr. GRPO per-group advantage centering A_{g,i} = R_{g,i} - mean(R_g).",
     )
     parser.add_argument(
         "--remote-host",

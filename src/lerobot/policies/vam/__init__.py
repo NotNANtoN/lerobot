@@ -60,6 +60,10 @@ from .cosmos_cache_dataset import (
     CosmosFeatureCacheManifestError,
     load_cache_manifest,
 )
+from .expo_residual import (
+    ExpoResidualCritic,
+    compute_dr_grpo_advantages,
+)
 from .vam_split import (
     DEFAULT_TRAIN_EPISODES,
     DEFAULT_VAL_EPISODES,
@@ -342,4 +346,6 @@ __all__ = [
     "sample_edm_sigmas",
     "save_native_lora",
     "validate_training_episodes",
+    "ExpoResidualCritic",
+    "compute_dr_grpo_advantages",
 ]

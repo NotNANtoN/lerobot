@@ -22,6 +22,12 @@ from .factory import (
 from .pretrained import PreTrainedRewardModel as PreTrainedRewardModel
 from .robometer.configuration_robometer import RobometerConfig as RobometerConfig
 from .sarm.configuration_sarm import SARMConfig as SARMConfig
+from .sequence_detector import (
+    MultiFrameSuccessDetector as MultiFrameSuccessDetector,
+    SharedFeatureSequenceDetector as SharedFeatureSequenceDetector,
+    SingleFrameResNet50Detector as SingleFrameResNet50Detector,
+    extract_sequence_window as extract_sequence_window,
+)
 from .topreward.configuration_topreward import TOPRewardConfig as TOPRewardConfig
 
 __all__ = [
@@ -32,6 +38,11 @@ __all__ = [
     "TOPRewardConfig",
     # Base class
     "PreTrainedRewardModel",
+    # Sequence detectors
+    "MultiFrameSuccessDetector",
+    "SharedFeatureSequenceDetector",
+    "SingleFrameResNet50Detector",
+    "extract_sequence_window",
     # Factory functions
     "get_reward_model_class",
     "make_reward_model",

@@ -84,9 +84,12 @@ class SO101CubeBoxEnv(gym.Env):
         max_episode_steps: int = 600,
         n_substeps: int = 16,
         randomize: bool = False,
+        reward_mode: str = "dense",
         task_instruction: str = DEFAULT_TASK_INSTRUCTION,
     ):
         super().__init__()
+        if reward_mode not in ("dense", "sparse"):
+            raise ValueError(f"Unsupported reward_mode={reward_mode!r}; expected 'dense' or 'sparse'.")
         self.obs_type = obs_type
         self.render_mode = render_mode
         self.observation_width = observation_width
@@ -96,6 +99,7 @@ class SO101CubeBoxEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.n_substeps = n_substeps
         self.randomize = randomize
+        self.reward_mode = reward_mode
         self.task = task_instruction
         self.task_description = task_instruction
 
@@ -183,12 +187,15 @@ class SO101CubeBoxEnv(gym.Env):
         in_box_z = 0.015 <= cube_pos[2] <= 0.095
         is_success = bool(in_box_x and in_box_y and in_box_z)
 
-        reward = 1.0 if is_success else (reach_reward + lift_reward + transport_reward)
+        dense_reward = 1.0 if is_success else (reach_reward + lift_reward + transport_reward)
+        reward = (1.0 if is_success else 0.0) if self.reward_mode == "sparse" else dense_reward
         info = {
             "is_success": is_success,
             "cube_pos": cube_pos,
             "dist_to_cube": dist_to_cube,
             "is_lifted": is_lifted,
+            "dense_reward": dense_reward,
+            "sparse_reward": 1.0 if is_success else 0.0,
         }
         return reward, is_success, info
 
@@ -254,4 +261,11 @@ if "lerobot/SO101CubeBox-v0" not in gym_registry:
     gym.register(
         id="lerobot/SO101CubeBox-v0",
         entry_point="lerobot.envs.so101_cube_box:SO101CubeBoxEnv",
+    )
+
+if "lerobot/SO101CubeBoxSparse-v0" not in gym_registry:
+    gym.register(
+        id="lerobot/SO101CubeBoxSparse-v0",
+        entry_point="lerobot.envs.so101_cube_box:SO101CubeBoxEnv",
+        kwargs={"reward_mode": "sparse"},
     )

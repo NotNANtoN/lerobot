@@ -78,6 +78,39 @@ Metric: mixed-unit aggregate RMSE over a 30-step chunk (5 arm joints in degrees 
 | 09-25 | FLUX 3 Action SO-101, zero-shot, checkpoint quantiles            | same                      |                   23.71 |  1.18 |  3.53 | `VALID`; our calibration is outside the checkpoint's state range (clipped)                                                   |
 | 10-31 | Cosmos 3 Edge (frozen base) + SmolExpert, 30m fast recipe (stride 1, cached VAE, Triton) | BS 16, 3 Euler steps, 2,580 steps | 16.64 | 6.28 | 8.01 | `VALID` @`a7c156de`, Val Flow Loss `0.0688`, Arm `17.81°`, Grip `8.61`. HF: `Orellius/so101_sort_cubes_no_top_cosmos3_edge_smolexpert` |
 | 10-31 | Cosmos 3 Edge **joint DoRA** (`r=16, α=32`, gen tower) + SmolExpert, 30m warm-start | BS 16, 3 Euler steps, 936 steps | **16.34** | **6.12** | **7.78** | `VALID` @`a7c156de`, Val Flow Loss `0.0712` (`0.0684` @ step 600; H1 `6.10` @ step 936), Arm `17.48°`, Grip `8.60`. HF: `Orellius/so101_sort_cubes_no_top_cosmos3_edge_dora_smolexpert` |
+| 10-31 | **SmolVLA 450M** (`sort-cubes-smolvla-100k-exact`), evaluated on canonical val `68..72` (200 anchors, stride 5) | 100k steps, native 30 Hz (and 10 Hz subsampled) | **6.06** (`6.47` @10Hz) | **5.33** | **5.02** (`5.67` @10Hz) | `VALID` @`a7c156de`, Arm `5.87°`, Grip `4.54`, median latency `215.4 ms`. Lower full-chunk RMSE on static holds, higher H1 (`5.33°` vs `4.31°`) and `2.7x` slower than compiled Cosmos 3 Edge (`~80 ms`) |
+
+## 3b. Reward Detector & Sparse-Reward RL Post-Training (`SO101CubeBoxSparse-v0`, 10 Spawns)
+
+### Real Dataset Success Detector (`Orellius/so101_sort_cubes_no_top`, 3-Way Split: Train `0..57`, Val `58..67`, Test `68..72` & `68..76`)
+
+| Detector Architecture & Training Recipe | Val (`58..67`) Acc / Prec / Rec / F1 | Held-Out Test (`68..72`) Acc / Prec / Rec / F1 | Full Test (`68..76`) Acc / Prec / Rec / F1 | Empty-Box Look False-Positive Rate |
+| :--- | :---: | :---: | :---: | :---: |
+| `SingleFrameResNet50Detector` (Baseline) | — | `61.4%` / `28.6%` / `80.0%` / `0.426` | — | `60.0%` |
+| `MultiFrameSuccessDetector` (Initial Heuristic) | — | `80.0%` / `68.8%` / `55.0%` / `0.611` | — | `15.0%` |
+| `MultiFrameSuccessDetector` (**Boosted: Pan>32° Drop Window + 6-View Aug + MixView + 50% Proprio Dropout + Val Early Stop**) | **`100.0%` / `100.0%` / `100.0%` / `1.000`** | **`100.0%` / `100.0%` / `100.0%` / `1.000`** | **`99.2%` / `97.3%` / `100.0%` / `0.986`** | **`0.0%`** (`68..72`), `2.78%` (`68..76`) |
+| *— Boosted Detector Evaluated 100% Blind to Joints (`seq_states = 0`)* | `99.3%` / `97.6%` / `100.0%` / `0.988` | **`100.0%` / `100.0%` / `100.0%` / `1.000`** | **`99.2%` / `97.3%` / `100.0%` / `0.986`** | **`0.0%`** |
+| `SharedFeatureSequenceDetector` on **Cosmos 3 Edge LoRA** Tokens (`[24, 2048]`, 3 seeds) | **`100.0%` / `100.0%` / `100.0%` / `1.000`** | **`100.0%` / `100.0%` / `100.0%` / `1.000`** | **`98.15%` / `93.93%` / `100.0%` / `0.969`** | **`0.0%`** (`68..72`), `3.71%` (`68..76`) |
+| `SharedFeatureSequenceDetector` on **SmolVLA SigLIP** Tokens (`[24, 960]`, 3 seeds) | **`100.0%` / `100.0%` / `100.0%` / `1.000`** | **`98.57%` / `95.38%` / `100.0%` / `0.976`** | **`98.94%` / `96.54%` / `100.0%` / `0.982`** | **`0.0%`** (`68..72` & `68..76`) |
+
+### 10-Spawn Closed-Loop RL Post-Training Ablation: Vanilla EXPO vs. Score-Centered EXPO (Dr. GRPO)
+
+Evaluated across 10 randomized cube spawns ($\pm 3.5\text{ cm}$) from a 60-episode exploration buffer (`6` rollouts/spawn):
+
+| Policy / Post-Training Method | Reward Signal | Training Steps | **Closed-Loop Success (`10` Spawns)** | Successful Spawn IDs | Mean Min EE-to-Cube (`cm`) | Mean Max Cube Lift (`cm`) | Mean Shaped Reward |
+| :--- | :--- | :---: | :---: | :--- | :---: | :---: | :---: |
+| **Zero-Shot Base Policy** (`Cosmos 3 Edge LoRA + SmolExpert`) | — | `0` | **`0/10 (0%)`** | `[]` | `3.79 cm` | `0.91 cm` | `0.231` |
+| **Vanilla EXPO** (Uncentered AWR, $w_i = \exp(\beta R_i)$) | **100% Learned Sequence Detector** | `2,500` (`1x`) | **`7/10 (70%)`** | `[0, 2, 3, 5, 7, 8, 9]` | `1.95 cm` | `16.88 cm` | `0.811` |
+| **Score-Centered EXPO (Dr. GRPO)** ($A_{g,i} = R_{g,i} - \bar{R}_g$) | **100% Learned Sequence Detector** | `2,500` (`1x`) | **`7/10 (70%)`** | `[0, 1, 3, 4, 5, 7, 8]` | `2.06 cm` | `15.49 cm` | `0.768` |
+| **Vanilla EXPO** (Uncentered AWR, $w_i = \exp(\beta R_i)$) | **Sparse Oracle (`0/1`)** | `2,500` (`1x`) | **`7/10 (70%)`** | `[0, 2, 3, 5, 7, 8, 9]` | `1.98 cm` | `15.96 cm` | `0.834` |
+| **Score-Centered EXPO (Dr. GRPO)** ($A_{g,i} = R_{g,i} - \bar{R}_g$) | **Sparse Oracle (`0/1`)** | `2,500` (`1x`) | **`8/10 (80%)`** | `[0, 1, 2, 3, 4, 5, 7, 8]` | `1.68 cm` | `17.38 cm` | `0.853` |
+| **Vanilla EXPO** (Uncentered AWR, $w_i = \exp(\beta R_i)$) | **100% Learned Sequence Detector** | `5,000` (`2x`) | **`7/10 (70%)`** | `[0, 1, 2, 3, 4, 5, 9]` | `2.07 cm` | `17.80 cm` | `0.846` |
+| **Score-Centered EXPO (Dr. GRPO)** ($A_{g,i} = R_{g,i} - \bar{R}_g$) | **100% Learned Sequence Detector** | `5,000` (`2x`) | **`9/10 (90%)`** | `[0, 1, 2, 3, 4, 5, 7, 8, 9]` | **`1.68 cm`** | **`19.32 cm`** | **`0.922`** |
+| **Vanilla EXPO** (Uncentered AWR, $w_i = \exp(\beta R_i)$) | **Sparse Oracle (`0/1`)** | `5,000` (`2x`) | **`8/10 (80%)`** | `[0, 1, 2, 3, 5, 7, 8, 9]` | `1.83 cm` | `18.72 cm` | `0.884` |
+| **Score-Centered EXPO (Dr. GRPO)** ($A_{g,i} = R_{g,i} - \bar{R}_g$) | **Sparse Oracle (`0/1`)** | `5,000` (`2x`) | **`9/10 (90%)`** | `[0, 1, 2, 3, 4, 5, 7, 8, 9]` | **`1.53 cm`** | **`19.64 cm`** | **`0.922`** |
+| **Cosmos 3 Edge + Marek Score-Centered EXPO** (`arXiv:2609.20807` sampler score subtraction) | **Shared Sequence Detector** | `5,000` (`2x`) | **`8/10–9/10 (80–90%)`** | `[0, 1, 2, 3, 4, 5, 7, 8, 9]` | **`1.70 cm`** | **`17.50 cm`** | **`0.880`** |
+| **SmolVLA Zero-Shot Base Policy** (`450M`) | — | `0` | **`0/10 (0%)`** | `[]` | `3.35 cm` | `1.02 cm` | `0.245` |
+| **SmolVLA + Marek Score-Centered EXPO** (`arXiv:2609.20807` sampler score subtraction) | **SmolVLA Shared Sequence Detector** | `5,000` (`2x`) | **`9/10 (90%)`** | `[0, 1, 2, 3, 4, 5, 7, 8, 9]` | **`1.79 cm`** | **`18.98 cm`** | **`0.915`** |
 
 ## 4. Video prediction (PSNR/SSIM) — diagnostic only
 

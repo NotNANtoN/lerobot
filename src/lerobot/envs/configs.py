@@ -811,6 +811,7 @@ class SO101CubeBoxEnvConfig(EnvConfig):
     observation_width: int = 640
     render_mode: str = "rgb_array"
     randomize: bool = False
+    reward_mode: str = "dense"
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
@@ -853,6 +854,7 @@ class SO101CubeBoxEnvConfig(EnvConfig):
             "observation_height": self.observation_height,
             "max_episode_steps": self.episode_length,
             "randomize": self.randomize,
+            "reward_mode": self.reward_mode,
             "task_instruction": self.task
             or "Grab the purple cube and put it into the cardboard box, ignore the other objects",
         }
