@@ -879,14 +879,6 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         usable_ram_bytes = max(0, avail_ram_bytes - ram_headroom_bytes)
 
         usable_vram_bytes = 0
-        if torch.cuda.is_available():
-            try:
-                free_vram, _ = torch.cuda.mem_get_info()
-                vram_headroom_bytes = 24 * (1024**3)
-                usable_vram_bytes = max(0, int(free_vram) - vram_headroom_bytes)
-            except Exception:
-                usable_vram_bytes = 0
-
         req_gb = required_bytes / (1024**3)
         avail_gb = avail_ram_bytes / (1024**3)
         usable_total_gb = (usable_ram_bytes + usable_vram_bytes) / (1024**3)
@@ -1345,11 +1337,29 @@ def evaluate_validation(
                 ):
                     raise ValueError("Cosmos3 cache context must be bfloat16 [600, 2048]")
             elif extractor is not None:
+                has_trainable_bb = hasattr(extractor, "parameters") and any(
+                    p.requires_grad for p in extractor.parameters()
+                )
                 if not hasattr(extractor, "_val_context_cache"):
                     cast(Any, extractor)._val_context_cache = {}
+                if not hasattr(extractor, "_val_latent_cache"):
+                    cast(Any, extractor)._val_latent_cache = {}
                 val_cache: dict[str, Tensor] = cast(Any, extractor)._val_context_cache
-                if all(item.sample_id in val_cache for item in batch_items):
+                val_lat_cache: dict[str, Tensor] = cast(Any, extractor)._val_latent_cache
+                if not has_trainable_bb and all(item.sample_id in val_cache for item in batch_items):
                     contexts = torch.stack([val_cache[item.sample_id] for item in batch_items]).to(device=device)
+                elif (
+                    has_trainable_bb
+                    and hasattr(extractor, "forward_transformer_blocks")
+                    and all(item.sample_id in val_lat_cache for item in batch_items)
+                ):
+                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        lat_b = torch.stack([val_lat_cache[item.sample_id] for item in batch_items]).to(
+                            device=device, non_blocking=True
+                        )
+                        tap_b = extractor.forward_transformer_blocks(lat_b)
+                        lyr_k = next(iter(tap_b.keys()))
+                        contexts = tap_b[lyr_k].to(device=device)
                 else:
                     raw_rgb = torch.stack(
                         [item.rgb.to(device=device, non_blocking=True) for item in batch_items]
@@ -1360,6 +1370,8 @@ def evaluate_validation(
                             extractor, "forward_transformer_blocks"
                         ):
                             lat_b = extractor.encode_latents(rgb_in)
+                            for b_item, lat_t in zip(batch_items, lat_b, strict=False):
+                                val_lat_cache[b_item.sample_id] = lat_t.detach().cpu()
                             tap_b = extractor.forward_transformer_blocks(lat_b)
                             lyr_k = next(iter(tap_b.keys()))
                             contexts = tap_b[lyr_k].to(device=device)
@@ -1369,8 +1381,9 @@ def evaluate_validation(
                                 out_f = extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
                                 extracted_eval.append(out_f.features)
                             contexts = torch.cat(extracted_eval, dim=0).to(device=device)
-                        for b_item, ctx_t in zip(batch_items, contexts, strict=False):
-                            val_cache[b_item.sample_id] = ctx_t.detach().cpu()
+                        if not has_trainable_bb:
+                            for b_item, ctx_t in zip(batch_items, contexts, strict=False):
+                                val_cache[b_item.sample_id] = ctx_t.detach().cpu()
             else:
                 raise ValueError(
                     "Evaluation requires cached context or an extractor; random features are forbidden"
@@ -1989,6 +2002,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1000,
         help="Last-weight save interval in optimizer steps; <=0 saves only at end.",
+    )
+    parser.add_argument(
+        "--max-train-seconds",
+        type=float,
+        default=None,
+        help="Optional wall-clock training time limit in seconds; triggers clean final eval and save when reached.",
     )
     args = parser.parse_args(argv)
     if args.eval_run_dir is not None:
@@ -3247,8 +3266,29 @@ def main(argv: list[str] | None = None) -> int:
                         if train_bb and hasattr(backbone_extractor, "encode_latents") and hasattr(
                             backbone_extractor, "forward_transformer_blocks"
                         ):
-                            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                                latents_batch = backbone_extractor.encode_latents(rgb_in)
+                            if not hasattr(backbone_extractor, "_online_latent_cache"):
+                                backbone_extractor._online_latent_cache = {}
+                            lat_cache: dict[str, Tensor] = backbone_extractor._online_latent_cache
+                            if not args.augment and all(item.sample_id in lat_cache for item in batch_items):
+                                latents_batch = torch.stack(
+                                    [lat_cache[item.sample_id] for item in batch_items]
+                                ).to(device=device, non_blocking=True)
+                            else:
+                                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                    latents_batch = backbone_extractor.encode_latents(rgb_in)
+                                    if (
+                                        not args.augment
+                                        and not getattr(backbone_extractor, "_ram_cache_full", False)
+                                        and len(lat_cache) < 16384
+                                    ):
+                                        if (
+                                            len(lat_cache) % 128 == 0
+                                            and OnlineVideoDataset._get_available_ram_bytes() < 12 * (1024**3)
+                                        ):
+                                            backbone_extractor._ram_cache_full = True
+                                        else:
+                                            for b_item, lat_t in zip(batch_items, latents_batch, strict=False):
+                                                lat_cache[b_item.sample_id] = lat_t.detach().cpu()
                             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                                 tapped = backbone_extractor.forward_transformer_blocks(latents_batch)
                                 contexts = tapped[args.backbone_layer].to(device=device)
@@ -3328,7 +3368,9 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         # Periodic Validation & Early Stopping Check on exact optimizer step boundaries
-        if opt_step % args.val_every == 0 or opt_step == args.max_steps:
+        max_sec = getattr(args, "max_train_seconds", None)
+        time_limit_reached = max_sec is not None and (time.time() - start_time) >= float(max_sec)
+        if opt_step % args.val_every == 0 or opt_step == args.max_steps or time_limit_reached:
             val_metrics = evaluate_validation(
                 decoder,
                 val_dataset,
@@ -3477,6 +3519,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"Early stopping triggered at step {opt_step}: no validation improvement "
                     f"for {early_stopping.patience} evaluations. Best RMSE: {early_stopping.best_metric:.3f} "
                     f"at step {early_stopping.best_step}."
+                )
+                break
+            if time_limit_reached:
+                print(
+                    f"Wall-clock time limit ({max_sec}s) reached at step {opt_step} "
+                    f"(elapsed {time.time() - start_time:.1f}s). Finishing cleanly...",
+                    flush=True,
                 )
                 break
 

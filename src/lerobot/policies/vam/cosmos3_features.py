@@ -802,6 +802,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                     self.transformer, config.lora_checkpoint, merge=False
                 )
             else:
+                from lerobot.policies.vam.cosmos_lora import merge_lora_into_base
+
                 load_cosmos3_lora(
                     self.transformer,
                     config.lora_checkpoint,
@@ -810,6 +812,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                     block_indices=range(len(self.transformer.layers)),
                     use_dora=config.lora_use_dora if config.trainable_lora else None,
                 )
+                if not config.trainable_lora:
+                    merge_lora_into_base(self.transformer)
         elif config.trainable_lora:
             from lerobot.policies.vam.cosmos3_lora import (
                 DUAL_PATHWAY_TARGET_MODULES,
