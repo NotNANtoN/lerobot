@@ -166,7 +166,7 @@ def smolvla_predict_chunk_30(rgb_hwc_u8: np.ndarray, state_deg_6: np.ndarray, se
 # PART A: OFFLINE HELD-OUT VALIDATION (`68..72`) ON `so101_sort_cubes_no_top`
 # =============================================================================
 snap_dir = sorted(
-    Path("/root/.cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
+    (Path.home() / ".cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
 )[-1]
 ep_files = sorted((snap_dir / "meta/episodes/chunk-000").glob("*.parquet"))
 ep_table = pa.concat_tables([pq.read_table(f) for f in ep_files]).to_pydict()

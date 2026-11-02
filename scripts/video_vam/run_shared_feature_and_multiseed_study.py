@@ -120,7 +120,7 @@ else:
     import pyarrow.parquet as pq
 
     snap_dir = sorted(
-        Path("/root/.cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
+        (Path.home() / ".cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
     )[-1]
     ep_files = sorted((snap_dir / "meta/episodes/chunk-000").glob("*.parquet"))
     ep_table = pa.concat_tables([pq.read_table(f) for f in ep_files]).to_pydict()
@@ -451,6 +451,15 @@ def eval_real_detectors_3seeds() -> dict:
 
         seq_det.load_state_dict(best_seq_sd)
         shared_det.load_state_dict(best_sh_sd)
+        if seed == 0:
+            torch.save(
+                {"state_dict": best_sh_sd, "seq_len": SEQ_LEN, "ctx_dim": 2048},
+                OUT_DIR / "shared_seq_detector_seed0.pt",
+            )
+            torch.save(
+                {"state_dict": best_seq_sd, "seq_len": SEQ_LEN},
+                OUT_DIR / "dedicated_resnet18_seq_detector_seed0.pt",
+            )
         seq_det.eval()
         shared_det.eval()
         sf_head.eval()
@@ -531,7 +540,7 @@ for _s_idx, bad_list in sorted(pooled_bad_by_spawn.items()):
 
 # Setup MuJoCo Env for true wrist-camera token extraction on failed sweeps & 3-Seed Closed-Loop Eval
 _snap_dir = sorted(
-    Path("/root/.cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
+    (Path.home() / ".cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
 )[-1]
 _ep0_table = _pq.read_table(sorted((_snap_dir / "data/chunk-000").glob("*.parquet"))[0], columns=["action"]).to_pydict()
 raw_actions = np.asarray(_ep0_table["action"][:480], dtype=np.float32)
@@ -910,6 +919,8 @@ for name, r_key, sc_flag, seed0_res in configs_to_test:
         actor_critic = train_expo_actor_critic(
             all_60_eps, reward_key=r_key, score_centered=sc_flag, steps=5000, lr=2e-3, seed=s_i
         )
+        if name == "ScoreCentered_EXPO_SharedCosmos3_SeqDet" and s_i == 1:
+            torch.save(actor_critic.state_dict(), OUT_DIR / "expo_score_centered_seq_det_5000.pt")
         ev = eval_closed_loop_10spawns(actor_critic)
         seed_runs.append(ev)
         print(

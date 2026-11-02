@@ -393,7 +393,7 @@ if real_cache_path.exists():
 else:
     t0 = time.time()
     snap_candidates = sorted(
-        Path("/root/.cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
+        (Path.home() / ".cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
     )
     snap_dir = snap_candidates[-1]
     train_eps = list(range(0, 68))
@@ -423,7 +423,7 @@ print("=========================================================================
 import pyarrow.parquet as _pq
 
 _snap_dir = sorted(
-    Path("/root/.cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
+    (Path.home() / ".cache/huggingface/lerobot/hub/datasets--Orellius--so101_sort_cubes_no_top/snapshots").glob("*")
 )[-1]
 _ep0_table = _pq.read_table(sorted((_snap_dir / "data/chunk-000").glob("*.parquet"))[0], columns=["action"]).to_pydict()
 raw_actions = np.asarray(_ep0_table["action"][:480], dtype=np.float32)

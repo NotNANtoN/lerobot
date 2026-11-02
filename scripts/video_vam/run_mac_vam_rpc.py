@@ -60,7 +60,7 @@ from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.latency_tracker import LatencyTracker
 
-SSH_HOST = os.environ.get("VAM_SSH_HOST", "runpod-vam")
+SSH_HOST = os.environ.get("VAM_SSH_HOST", "abakus")
 
 
 def _ssh_executable() -> str:
